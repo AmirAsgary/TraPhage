@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-Nanobody Phage Display Pipeline — MLM + Autoregressive VAE (v3.2)
+Nanobody Phage Display Pipeline — MLM + Autoregressive VAE (v3.3)
 ================================================================================
 End-to-end pipeline:
   Stage 1 — MLM: Masked language model pretraining on R0 sequences.
@@ -12,6 +12,11 @@ End-to-end pipeline:
 Enrichment:
   E_R0 = 1.0 (identity), E_R1 = freq_R1/freq_R0, E_R3 = freq_R3/freq_R0.
 
+v3.3 changes:
+  --num_decoding N: run inference with N random decoding orders, save all
+  per-sequence outputs in HDF5 (keyed by sequence ID), report mean±std in
+  TSV, and use mean values for analysis plots.
+
 Usage examples:
   python pipeline.py --r0_train r0.fa --r1_train r1.fa --r3_train r3.fa \
       --output_dir out --mlm --epochs 20
@@ -20,7 +25,7 @@ Usage examples:
       --output_dir out --autoregressive_vae --epochs 50
 
   python pipeline.py --r0_train r0.fa --r1_train r1.fa --r3_train r3.fa \
-      --output_dir out --inference --inference_mask_rounds R1,R3
+      --output_dir out --inference --inference_mask_rounds R1,R3 --num_decoding 10
 
   python pipeline.py --r0_train r0.fa --r1_train r1.fa --r3_train r3.fa \
       --output_dir out --generator --n_generate 1000
@@ -88,6 +93,7 @@ BLOSUM62_FULL = np.vstack([BLOSUM62_NORM, np.zeros((3, 20), dtype=np.float32)])
 ALL_PERMS = tf.constant([
     [0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]
 ], dtype=tf.int32)
+ALL_PERMS_NP = ALL_PERMS.numpy()
 
 
 # =============================================================================
@@ -95,7 +101,7 @@ ALL_PERMS = tf.constant([
 # =============================================================================
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Nanobody Pipeline v3: MLM + Autoregressive VAE",
+        description="Nanobody Pipeline v3.3: MLM + Autoregressive VAE",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     g = p.add_argument_group("Data")
     g.add_argument("--r0_train", required=True); g.add_argument("--r1_train", required=True)
@@ -159,6 +165,10 @@ def parse_args():
     g7.add_argument("--inference_batch_size", type=int, default=512)
     g7.add_argument("--inference_mask_rounds", type=str, default="",
                     help="Comma-sep rounds to mask, e.g. 'R1,R3'.")
+    g7.add_argument("--num_decoding", type=int, default=1,
+                    help="Number of random decoding orders for inference. "
+                         "Each uses a different permutation of [R0,R1,R3]. "
+                         "Results saved per-sequence in HDF5; TSV reports mean±std.")
     g7.add_argument("--n_generate", type=int, default=100)
     g8 = p.add_argument_group("Performance")
     g8.add_argument("--mixed_precision", action="store_true")
@@ -259,7 +269,9 @@ def write_tfrecords(data, indices, out_dir, prefix, n_shards, max_len):
         path = os.path.join(out_dir, f"{prefix}_{sh:05d}.tfrecord")
         with tf.io.TFRecordWriter(path) as w:
             for idx in indices[s:e]:
-                feat = {"seq": _bf(data["seqs"][idx].tobytes()),
+                sid = data["ids"][idx].encode("utf-8")
+                feat = {"sid": _bf(sid),
+                        "seq": _bf(data["seqs"][idx].tobytes()),
                         "slen": _if(int(data["slens"][idx])),
                         "freq": _bf(data["freq"][idx].tobytes()),
                         "pres": _bf(data["pres"][idx].tobytes())}
@@ -297,8 +309,6 @@ def preprocess_data(args):
         if len(test_idx) > 0:
             write_tfrecords(data, test_idx, tfdir, "test", max(1, ns//4), args.max_len)
         n_val, n_test = len(val_idx), len(test_idx)
-    np.save(os.path.join(tfdir, "ids_train.npy"),
-            np.array([data["ids"][i] for i in train_idx], dtype=object))
     meta = {"n_total": n, "n_train": len(train_idx), "n_val": n_val,
             "n_test": n_test, "max_len": args.max_len,
             "totals": data["totals"].tolist(), "val_source": val_src}
@@ -324,6 +334,7 @@ def load_meta(args):
 # =============================================================================
 def _parse_ex(raw, max_len):
     p = tf.io.parse_single_example(raw, {
+        "sid": tf.io.FixedLenFeature([], tf.string),
         "seq": tf.io.FixedLenFeature([], tf.string),
         "slen": tf.io.FixedLenFeature([], tf.int64),
         "freq": tf.io.FixedLenFeature([], tf.string),
@@ -333,7 +344,7 @@ def _parse_ex(raw, max_len):
     slen = tf.cast(p["slen"], tf.int32)
     freq = tf.reshape(tf.io.decode_raw(p["freq"], tf.float32), [3])
     pres = tf.reshape(tf.io.decode_raw(p["pres"], tf.float32), [3])
-    return {"seq": seq, "slen": slen, "freq": freq, "pres": pres}
+    return {"sid": p["sid"], "seq": seq, "slen": slen, "freq": freq, "pres": pres}
 
 
 def _pad_mask(seq):
@@ -375,7 +386,7 @@ def _autoreg_map(parsed, max_len, mask_frac):
 
 def _inference_map(parsed, max_len):
     pmask = _pad_mask(parsed["seq"])
-    return {"seq": parsed["seq"], "input_ids": parsed["seq"],
+    return {"sid": parsed["sid"], "seq": parsed["seq"], "input_ids": parsed["seq"],
             "padding_mask": pmask, "freq": parsed["freq"], "pres": parsed["pres"]}
 
 
@@ -587,10 +598,6 @@ class AutoregressiveDecoder(tf.keras.layers.Layer):
        decoded values (presence, frequency, enrichment).
        Output: frequency and enrichment (2 values).
 
-    This separation ensures presence is predicted from sequence content and
-    round context only, forcing the model to learn binding-relevant features
-    rather than shortcuts through frequency statistics.
-
     State layouts:
       pres_state: [R0_pres, R0_decoded, R1_pres, R1_decoded, R3_pres, R3_decoded] = 6
       full_state: [R0_freq, R0_pres, R0_enrich, R0_decoded, R1_..., R3_...] = 12
@@ -624,17 +631,7 @@ class AutoregressiveDecoder(tf.keras.layers.Layer):
 
     def _decode_steps(self, seq_embed, freq, pres, enrich, round_mask, perms,
                       training):
-        """Core autoregressive loop with separated heads.
-
-        For each step in the permutation order:
-          1. pres_net predicts presence from (seq_embed, pres_state, round_oh)
-          2. fe_net predicts freq+enrich from (seq_embed, full_state, round_oh)
-          3. Both states are updated with decoded or ground-truth values.
-
-        Returns:
-            loss_freq, loss_pres, loss_enrich: scalar losses (masked only).
-            dec_freq, dec_pres, dec_enrich: [B,3] decoded values.
-        """
+        """Core autoregressive loop with separated heads."""
         B = tf.shape(seq_embed)[0]
         bi = tf.range(B)
         PS, FS = self.PRES_SLOT, self.FULL_SLOT
@@ -665,12 +662,12 @@ class AutoregressiveDecoder(tf.keras.layers.Layer):
             m = tf.gather_nd(round_mask, tf.stack([bi, ridx], 1))
 
             # --- Presence prediction (isolated: no freq/enrich info) ---
-            pres_inp = tf.concat([seq_embed, pres_state, r_oh], 1)  # [B, d+9]
-            pp_logit = self.pres_net(pres_inp, training=training)[:, 0]  # [B]
+            pres_inp = tf.concat([seq_embed, pres_state, r_oh], 1)
+            pp_logit = self.pres_net(pres_inp, training=training)[:, 0]
 
             # --- Freq/Enrichment prediction (full context) ---
-            fe_inp = tf.concat([seq_embed, full_state, r_oh], 1)  # [B, d+15]
-            fe_pred = self.fe_net(fe_inp, training=training)  # [B, 2]
+            fe_inp = tf.concat([seq_embed, full_state, r_oh], 1)
+            fe_pred = self.fe_net(fe_inp, training=training)
             pf, pe = fe_pred[:, 0], fe_pred[:, 1]
 
             # Losses (masked positions only)
@@ -680,28 +677,26 @@ class AutoregressiveDecoder(tf.keras.layers.Layer):
             loss_enrich += tf.reduce_sum(tf.square(pe - gt_e) * m)
             n_masked += tf.reduce_sum(m)
 
-            # Actual values: predicted if masked, GT if observed (clipped)
             act_f = tf.where(m > 0.5, tf.clip_by_value(pf, -10.0, 10.0), gt_f)
             act_p = tf.where(m > 0.5, tf.nn.sigmoid(pp_logit), gt_p)
             act_e = tf.where(m > 0.5, tf.clip_by_value(pe, -ENRICH_CLIP, ENRICH_CLIP), gt_e)
 
-            # Update presence-only state: [pres_val, is_decoded] per round
-            new_pres_slot = tf.stack([act_p, tf.ones([B])], 1)  # [B, 2]
+            # Update presence-only state
+            new_pres_slot = tf.stack([act_p, tf.ones([B])], 1)
             p_slots = [pres_state[:, r*PS:(r+1)*PS] for r in range(3)]
             for r in range(3):
                 is_r = tf.cast(tf.equal(ridx, r), tf.float32)[:, None]
                 p_slots[r] = p_slots[r] * (1.0 - is_r) + new_pres_slot * is_r
             pres_state = tf.concat(p_slots, 1)
 
-            # Update full state: [freq, pres, enrich, is_decoded] per round
-            new_full_slot = tf.stack([act_f, act_p, act_e, tf.ones([B])], 1)  # [B, 4]
+            # Update full state
+            new_full_slot = tf.stack([act_f, act_p, act_e, tf.ones([B])], 1)
             f_slots = [full_state[:, r*FS:(r+1)*FS] for r in range(3)]
             for r in range(3):
                 is_r = tf.cast(tf.equal(ridx, r), tf.float32)[:, None]
                 f_slots[r] = f_slots[r] * (1.0 - is_r) + new_full_slot * is_r
             full_state = tf.concat(f_slots, 1)
 
-            # Store decoded values in canonical order
             for r in range(3):
                 is_r = tf.cast(tf.equal(ridx, r), tf.float32)
                 dec_freq = dec_freq.write(r, dec_freq.read(r)*(1.-is_r) + act_f*is_r)
@@ -725,10 +720,22 @@ class AutoregressiveDecoder(tf.keras.layers.Layer):
         return {"ar_loss_freq": lf, "ar_loss_pres": lp, "ar_loss_enrich": le,
                 "dec_freq": df, "dec_pres": dp, "dec_enrich": de}
 
-    def predict_with_mask(self, seq_embed, freq, pres, enrich, round_mask_vec):
-        """Inference: canonical order [0,1,2] with given mask."""
+    def predict_with_mask(self, seq_embed, freq, pres, enrich, round_mask_vec,
+                          perms=None):
+        """Inference: decode with given mask and optional custom permutations.
+
+        Args:
+            seq_embed: [B, d_model] encoder pooled output.
+            freq, pres, enrich: [B, 3] ground-truth values.
+            round_mask_vec: [B, 3] float, 1.0 = predict (masked), 0.0 = use GT.
+            perms: [B, 3] int32 permutation orders, or None for canonical [0,1,2].
+
+        Returns:
+            dict with dec_freq, dec_pres, dec_enrich [B, 3].
+        """
         B = tf.shape(seq_embed)[0]
-        perms = tf.tile(tf.constant([[0,1,2]], tf.int32), [B, 1])
+        if perms is None:
+            perms = tf.tile(tf.constant([[0,1,2]], tf.int32), [B, 1])
         _, _, _, df, dp, de = self._decode_steps(
             seq_embed, freq, pres, enrich, round_mask_vec, perms, training=False)
         return {"dec_freq": df, "dec_pres": dp, "dec_enrich": de}
@@ -738,11 +745,8 @@ class AutoregressiveDecoder(tf.keras.layers.Layer):
 # VAE (with enrichment)
 # =============================================================================
 class VAEEncoder(tf.keras.layers.Layer):
-    """Projects [seq_embed, R0_f, R0_p, R0_e, R1_f, R1_p, R1_e, R3_f, R3_p, R3_e]
-       -> hidden -> mu, logvar -> z."""
     def __init__(self, d_model, hidden_dim, latent_dim, dropout=0.1, reg=None, **kw):
         super().__init__(**kw)
-        # d_model + 3*(freq+pres+enrich) = d_model + 9
         self.fc = tf.keras.Sequential([
             tf.keras.layers.Dense(hidden_dim, activation="gelu", kernel_regularizer=reg),
             tf.keras.layers.Dropout(dropout),
@@ -751,13 +755,12 @@ class VAEEncoder(tf.keras.layers.Layer):
         self.logvar_layer = tf.keras.layers.Dense(latent_dim, kernel_regularizer=reg, name="logvar")
 
     def call(self, seq_embed, dec_freq, dec_pres, dec_enrich, training=False):
-        # Canonical order: [seq, R0_f, R0_p, R0_e, R1_f, R1_p, R1_e, R3_f, R3_p, R3_e]
         x = tf.concat([
             seq_embed,
             dec_freq[:, 0:1], dec_pres[:, 0:1], dec_enrich[:, 0:1],
             dec_freq[:, 1:2], dec_pres[:, 1:2], dec_enrich[:, 1:2],
             dec_freq[:, 2:3], dec_pres[:, 2:3], dec_enrich[:, 2:3],
-        ], axis=1)  # [B, d_model + 9]
+        ], axis=1)
         h = self.fc(x, training=training)
         mu = self.mu_layer(h)
         logvar = tf.clip_by_value(self.logvar_layer(h), -LOGVAR_CLIP, LOGVAR_CLIP)
@@ -767,7 +770,6 @@ class VAEEncoder(tf.keras.layers.Layer):
 
 
 class VAEDecoder(tf.keras.layers.Layer):
-    """Decodes z -> seq logits + round (freq, pres_logit, enrich) x 3."""
     def __init__(self, latent_dim, hidden_dim, max_len, dropout=0.1, reg=None, **kw):
         super().__init__(**kw)
         self.max_len = max_len
@@ -778,14 +780,12 @@ class VAEDecoder(tf.keras.layers.Layer):
         ], name="vae_dec_fc")
         self.seq_head = tf.keras.layers.Dense(max_len * N_AA, kernel_regularizer=reg,
                                               name="seq_recon")
-        # 3 rounds x (freq + pres_logit + enrich) = 9
         self.round_head = tf.keras.layers.Dense(9, kernel_regularizer=reg, name="round_recon")
 
     def call(self, z, training=False):
         h = self.fc(z, training=training)
         seq_logits = tf.reshape(self.seq_head(h), [-1, self.max_len, N_AA])
-        rout = self.round_head(h)  # [B, 9]
-        # Parse: [R0_freq, R0_pres_logit, R0_enrich, R1_..., R3_...]
+        rout = self.round_head(h)
         recon_freq = tf.stack([rout[:,0], rout[:,3], rout[:,6]], 1)
         recon_pres_logit = tf.stack([rout[:,1], rout[:,4], rout[:,7]], 1)
         recon_enrich = tf.stack([rout[:,2], rout[:,5], rout[:,8]], 1)
@@ -849,13 +849,26 @@ class AutoregVAEModel(tf.keras.Model):
             "dec_enrich": ar_out["dec_enrich"],
         }
 
-    def encode_to_latent(self, ids, pmask, freq, pres, round_mask_vec=None):
+    def encode_to_latent(self, ids, pmask, freq, pres, round_mask_vec=None,
+                         perms=None):
+        """Encode sequences to latent space with optional custom decode order.
+
+        Args:
+            ids: [B, L] int32 token IDs.
+            pmask: [B, L] float32 padding mask.
+            freq, pres: [B, 3] ground-truth frequency and presence.
+            round_mask_vec: [B, 3] float, 1.0 = predict, 0.0 = use GT. None → all GT.
+            perms: [B, 3] int32 decoding order, or None for canonical [0,1,2].
+
+        Returns:
+            dict with z, mu, pooled, dec_freq, dec_pres, dec_enrich.
+        """
         pooled, _ = self.encoder(ids, pmask, training=False)
         enrich = compute_enrichment(freq, self._log_enrich)
         if round_mask_vec is None:
             round_mask_vec = tf.zeros_like(freq)
         ar = self.autoreg.predict_with_mask(pooled, freq, pres, enrich,
-                                            round_mask_vec)
+                                            round_mask_vec, perms=perms)
         z, mu, logvar = self.vae_enc(
             pooled, ar["dec_freq"], ar["dec_pres"], ar["dec_enrich"],
             training=False)
@@ -880,14 +893,6 @@ def vae_recon_losses(seq_logits, original_ids, padding_mask,
                      recon_freq, true_freq,
                      recon_pres_logit, true_pres,
                      recon_enrich, true_enrich):
-    """Separate VAE reconstruction losses.
-
-    Returns:
-        seq_loss: sparse CCE on sequence (masked by padding).
-        freq_loss: MSE on frequency.
-        pres_loss: BCE on presence.
-        enrich_loss: MSE on enrichment.
-    """
     labels = tf.clip_by_value(tf.cast(original_ids, tf.int32), 0, 19)
     seq_ce = tf.keras.losses.sparse_categorical_crossentropy(
         labels, seq_logits, from_logits=True)
@@ -1234,7 +1239,6 @@ def train_autoreg_vae(args, meta):
     opt = make_optimizer(args, total); gc = args.grad_clip
     w_rs, w_rr, w_ar, w_kl = args.w_recon_seq, args.w_recon_round, args.w_autoreg, args.kl_weight
 
-    # GPU-resident accumulators — separate for each loss component
     a_tot = tf.Variable(0.0, trainable=False)
     a_mlm = tf.Variable(0.0, trainable=False)
     a_ar_freq = tf.Variable(0.0, trainable=False)
@@ -1247,7 +1251,7 @@ def train_autoreg_vae(args, meta):
     a_vae_enrich = tf.Variable(0.0, trainable=False)
     a_st = tf.Variable(0, trainable=False, dtype=tf.int32)
 
-    mf_weight = args.mlm_mask_frac  # weight for aux MLM loss
+    mf_weight = args.mlm_mask_frac
     use_log_e = args.log_enrichment
 
     @tf.function(jit_compile=args.xla)
@@ -1255,13 +1259,10 @@ def train_autoreg_vae(args, meta):
         with tf.GradientTape() as tape:
             out = model(batch, training=True)
             enrich_gt = compute_enrichment(batch["freq"], use_log_e)
-            # MLM auxiliary
             lm = mlm_loss(out["mlm_logits"], batch["seq"], batch["mlm_mask"]) * mf_weight
-            # Autoreg losses (already averaged over masked positions)
             l_ar_f = out["ar_loss_freq"] * w_ar
             l_ar_p = out["ar_loss_pres"] * w_ar
             l_ar_e = out["ar_loss_enrich"] * w_ar
-            # VAE reconstruction
             vs, vf, vp, ve = vae_recon_losses(
                 out["seq_logits"], batch["seq"], batch["padding_mask"],
                 out["recon_freq"], batch["freq"],
@@ -1271,7 +1272,6 @@ def train_autoreg_vae(args, meta):
             l_vae_freq = vf * w_rr
             l_vae_pres = vp * w_rr
             l_vae_enrich = ve * w_rr
-            # KL
             lk = kl_divergence(out["mu"], out["logvar"]) * w_kl
             total_loss = (lm + l_ar_f + l_ar_p + l_ar_e +
                           l_vae_seq + l_vae_freq + l_vae_pres + l_vae_enrich +
@@ -1299,7 +1299,6 @@ def train_autoreg_vae(args, meta):
         return ((out["ar_loss_freq"]+out["ar_loss_pres"]+out["ar_loss_enrich"])*w_ar +
                 vs*w_rs + (vf+vp+ve)*w_rr + lk*w_kl)
 
-    # Resume
     start_ep, gstep, best_val, patience_ctr = 1, 0, float("inf"), 0
     history = {
         "train_loss": [], "val_loss": [],
@@ -1384,10 +1383,69 @@ def train_autoreg_vae(args, meta):
 
 
 # =============================================================================
-# INFERENCE
+# INFERENCE (with --num_decoding multi-order support)
 # =============================================================================
+def _select_permutations(n_dec, seed):
+    """Select N decoding permutations from the 6 possible orderings of [R0,R1,R3].
+
+    For N<=6: sample without replacement (all unique orderings).
+    For N>6:  sample with replacement (some orderings repeated).
+
+    Args:
+        n_dec: Number of decoding orders.
+        seed: Random seed for reproducibility.
+    Returns:
+        perms_np: [N_dec, 3] int32 numpy array of permutation orderings.
+    """
+    rng = np.random.RandomState(seed + 7777)
+    if n_dec <= 6:
+        idx = rng.choice(6, n_dec, replace=False)
+    else:
+        idx = rng.choice(6, n_dec, replace=True)
+    return ALL_PERMS_NP[idx]  # [N_dec, 3]
+
+
 def run_inference(args, meta):
+    """Inference with N random decoding orders.
+
+    For each decoding order d in [0, N_dec):
+        - A fixed permutation of [R0,R1,R3] is used for the autoregressive decoder
+        - All sequences are processed in a single pass over the dataset
+        - Per-sequence outputs (z, mu, dec_freq, dec_pres, dec_enrich) are collected
+
+    Outputs:
+        decodings.h5:  HDF5 with per-sequence groups keyed by sequence ID.
+            /<seq_id>/z:           [N_dec, latent_dim]
+            /<seq_id>/mu:          [N_dec, latent_dim]
+            /<seq_id>/dec_freq:    [N_dec, 3]
+            /<seq_id>/dec_pres:    [N_dec, 3]
+            /<seq_id>/dec_enrich:  [N_dec, 3]
+            /<seq_id>/pooled:      [d_model]          (same across decodings)
+            /<seq_id>/gt_freq:     [3]
+            /<seq_id>/gt_pres:     [3]
+            /meta/perm_orders:     [N_dec, 3]
+            /meta/num_decoding:    scalar
+            /meta/mask_rounds:     string
+
+        latents.npz:  Mean values for backward-compatible analysis pipeline.
+            z, mu, dec_freq, dec_pres, dec_enrich: [N_total, dim] (mean over decodings)
+            *_std variants: [N_total, dim] (std over decodings)
+            pooled, gt_freq, gt_pres: [N_total, dim]
+
+        predictions.tsv:  Mean ± std per sequence.
+    """
     log.info("=" * 60); log.info("INFERENCE"); log.info("=" * 60)
+
+    try:
+        import h5py
+    except ImportError:
+        log.error("h5py is required for inference with --num_decoding. "
+                  "Install with: pip install h5py")
+        return
+
+    N_dec = max(1, args.num_decoding)
+    log.info("Decoding orders: %d", N_dec)
+
     model = _init_model(AutoregVAEModel, args, _autoreg_dummy(args))
     cd = _ckpt_dir(args)
     loaded = False
@@ -1398,52 +1456,243 @@ def run_inference(args, meta):
             model.load_weights(wp); log.info("Loaded: %s", wp); loaded = True; break
     if not loaded: log.error("No autoreg_vae weights in %s", cd); return
 
+    # Parse masked rounds
     mask_rounds = set()
     if args.inference_mask_rounds:
         for r in args.inference_mask_rounds.split(","):
             r = r.strip().upper()
             if r in ROUND_NAMES: mask_rounds.add(ROUND_NAMES.index(r))
     log.info("Masking rounds: %s", [ROUND_NAMES[i] for i in mask_rounds])
+    if not mask_rounds and N_dec > 1:
+        log.warning("No rounds masked (--inference_mask_rounds empty). "
+                    "With all rounds observed, all %d decoding orders will "
+                    "produce identical results (GT pass-through).", N_dec)
+
+    # Select permutations
+    perms_np = _select_permutations(N_dec, args.seed)  # [N_dec, 3]
+    perm_labels = [f"[{','.join(ROUND_NAMES[r] for r in p)}]" for p in perms_np]
+    log.info("Permutation orders: %s", perm_labels)
 
     out_dir = os.path.join(args.output_dir, "inference"); os.makedirs(out_dir, exist_ok=True)
-    results = {k: [] for k in ["z","mu","dec_freq","dec_pres","dec_enrich","pooled"]}
-    total = 0
+
+    # ---- Phase 1: Single data pass to get sequence count, IDs, and shared data ----
+    # Encoder output (pooled) and ground truth are independent of decode order,
+    # so we only compute them once.
+    prefixes_available = []
     for prefix in ["train", "val", "test"]:
         tfdir = os.path.join(args.output_dir, "tfrecords")
-        if not glob.glob(os.path.join(tfdir, f"{prefix}_*.tfrecord")): continue
+        if glob.glob(os.path.join(tfdir, f"{prefix}_*.tfrecord")):
+            prefixes_available.append(prefix)
+
+    log.info("Phase 1/%d: Collecting encoder embeddings + ground truth...", N_dec + 1)
+    shared = {"pooled": [], "gt_freq": [], "gt_pres": []}
+    all_ids = []
+    # Also store input tensors (ids, pmask, freq, pres) per batch for reuse
+    # to avoid re-reading TFRecords N_dec times.
+    # For memory efficiency on huge datasets, we store freq/pres/pmask compactly.
+    cached_batches = []  # list of (input_ids_np, pmask_np, freq_np, pres_np)
+    total = 0
+
+    for prefix in prefixes_available:
         ds = build_dataset(args, prefix, "inference", shuffle=False)
         for batch in ds:
-            B = tf.shape(batch["input_ids"])[0]
-            rmask = tf.zeros([B, 3])
-            if mask_rounds:
-                cols = [tf.ones([B]) if r in mask_rounds else tf.zeros([B]) for r in range(3)]
-                rmask = tf.stack(cols, 1)
-            out = model.encode_to_latent(batch["input_ids"], batch["padding_mask"],
-                                         batch["freq"], batch["pres"], rmask)
-            for k in results: results[k].append(out[k].numpy())
-            total += int(B)
-            if total % (args.inference_batch_size*100) < args.inference_batch_size:
-                log.info("  processed %d", total)
-    for k in results: results[k] = np.concatenate(results[k], 0)
-    N = results["z"].shape[0]; log.info("Total: %d sequences", N)
-    np.savez_compressed(os.path.join(out_dir, "latents.npz"), **results)
-    ids_p = os.path.join(args.output_dir, "tfrecords", "ids_train.npy")
-    ids = np.load(ids_p, allow_pickle=True) if os.path.exists(ids_p) else None
-    with open(os.path.join(out_dir, "predictions.tsv"), "w") as f:
-        f.write("seq_id\tz_norm\tdec_freq_R0\tdec_freq_R1\tdec_freq_R3\t"
-                "dec_pres_R0\tdec_pres_R1\tdec_pres_R3\t"
-                "dec_enrich_R0\tdec_enrich_R1\tdec_enrich_R3\n")
-        for i in range(N):
-            sid = ids[i] if ids is not None and i < len(ids) else str(i)
-            zn = np.linalg.norm(results["z"][i])
-            f.write(f"{sid}\t{zn:.6f}\t"
-                    f"{results['dec_freq'][i,0]:.6f}\t{results['dec_freq'][i,1]:.6f}\t"
-                    f"{results['dec_freq'][i,2]:.6f}\t"
-                    f"{results['dec_pres'][i,0]:.4f}\t{results['dec_pres'][i,1]:.4f}\t"
-                    f"{results['dec_pres'][i,2]:.4f}\t"
-                    f"{results['dec_enrich'][i,0]:.4f}\t{results['dec_enrich'][i,1]:.4f}\t"
-                    f"{results['dec_enrich'][i,2]:.4f}\n")
-    log.info("Saved inference results to %s", out_dir)
+            B_val = batch["input_ids"].shape[0]
+            # Encoder forward (order-independent)
+            pooled, _ = model.encoder(batch["input_ids"], batch["padding_mask"],
+                                      training=False)
+            shared["pooled"].append(pooled.numpy())
+            shared["gt_freq"].append(batch["freq"].numpy())
+            shared["gt_pres"].append(batch["pres"].numpy())
+            all_ids.extend(s.numpy().decode("utf-8") for s in batch["sid"])
+            # Cache batch tensors for decode passes (avoid re-reading TFRecords)
+            cached_batches.append((
+                batch["input_ids"].numpy(),
+                batch["padding_mask"].numpy(),
+                batch["freq"].numpy(),
+                batch["pres"].numpy(),
+            ))
+            total += int(B_val)
+            if total % (args.inference_batch_size * 200) < args.inference_batch_size:
+                log.info("  encoded %d sequences", total)
+
+    for k in shared:
+        shared[k] = np.concatenate(shared[k], 0)
+    N_total = shared["pooled"].shape[0]
+    log.info("  Total: %d sequences, %d cached batches", N_total, len(cached_batches))
+
+    # ---- Phase 2: N_dec decode passes over cached batches ----
+    # Allocate output arrays: [N_total, N_dec, dim]
+    latent_dim = args.vae_latent_dim
+    z_all = np.zeros((N_total, N_dec, latent_dim), dtype=np.float32)
+    mu_all = np.zeros((N_total, N_dec, latent_dim), dtype=np.float32)
+    df_all = np.zeros((N_total, N_dec, 3), dtype=np.float32)
+    dp_all = np.zeros((N_total, N_dec, 3), dtype=np.float32)
+    de_all = np.zeros((N_total, N_dec, 3), dtype=np.float32)
+
+    for d in range(N_dec):
+        perm = perms_np[d]  # [3] int32
+        t0 = time.time()
+        log.info("Phase %d/%d: Decoding with order %s ...",
+                 d + 2, N_dec + 1, perm_labels[d])
+
+        offset = 0
+        for ids_np, pmask_np, freq_np, pres_np in cached_batches:
+            B_val = ids_np.shape[0]
+            # Build per-batch permutation tensor
+            perms_tf = tf.tile(tf.constant([perm], dtype=tf.int32), [B_val, 1])
+            # Build round mask
+            rmask_cols = [
+                tf.ones([B_val]) if r in mask_rounds else tf.zeros([B_val])
+                for r in range(3)
+            ]
+            rmask = tf.stack(rmask_cols, 1)  # [B, 3]
+
+            out = model.encode_to_latent(
+                tf.constant(ids_np), tf.constant(pmask_np),
+                tf.constant(freq_np), tf.constant(pres_np),
+                round_mask_vec=rmask, perms=perms_tf)
+
+            end = offset + B_val
+            z_all[offset:end, d] = out["z"].numpy()
+            mu_all[offset:end, d] = out["mu"].numpy()
+            df_all[offset:end, d] = out["dec_freq"].numpy()
+            dp_all[offset:end, d] = out["dec_pres"].numpy()
+            de_all[offset:end, d] = out["dec_enrich"].numpy()
+            offset = end
+
+        elapsed = time.time() - t0
+        log.info("  Decoding %d done in %.1fs (%.0f seq/s)",
+                 d, elapsed, N_total / max(elapsed, 1e-6))
+
+    # Free cached batch memory
+    del cached_batches
+
+    # ---- Compute mean and std across decodings ----
+    z_mean, z_std = z_all.mean(axis=1), z_all.std(axis=1)
+    mu_mean, mu_std = mu_all.mean(axis=1), mu_all.std(axis=1)
+    df_mean, df_std = df_all.mean(axis=1), df_all.std(axis=1)
+    dp_mean, dp_std = dp_all.mean(axis=1), dp_all.std(axis=1)
+    de_mean, de_std = de_all.mean(axis=1), de_all.std(axis=1)
+
+    # ---- Save HDF5 with per-sequence groups ----
+    h5_path = os.path.join(out_dir, "decodings.h5")
+    log.info("Writing HDF5: %s (%d sequences x %d decodings)", h5_path, N_total, N_dec)
+    PER_ID_THRESHOLD = 500_000  # per-ID groups are slow above this
+    t0_h5 = time.time()
+
+    with h5py.File(h5_path, "w") as hf:
+        # Metadata group
+        mg = hf.create_group("meta")
+        mg.create_dataset("perm_orders", data=perms_np)
+        mg.attrs["num_decoding"] = N_dec
+        mg.attrs["mask_rounds"] = args.inference_mask_rounds or ""
+        mg.attrs["perm_labels"] = json.dumps(perm_labels)
+
+        # Flat arrays for efficient bulk access
+        fg = hf.create_group("flat")
+        dt_str = h5py.string_dtype(encoding="utf-8")
+        fg.create_dataset("ids", data=np.array(all_ids, dtype=object), dtype=dt_str)
+        fg.create_dataset("pooled", data=shared["pooled"], compression="gzip",
+                          compression_opts=4)
+        fg.create_dataset("gt_freq", data=shared["gt_freq"])
+        fg.create_dataset("gt_pres", data=shared["gt_pres"])
+        fg.create_dataset("z", data=z_all, compression="gzip", compression_opts=4)
+        fg.create_dataset("mu", data=mu_all, compression="gzip", compression_opts=4)
+        fg.create_dataset("dec_freq", data=df_all, compression="gzip",
+                          compression_opts=4)
+        fg.create_dataset("dec_pres", data=dp_all, compression="gzip",
+                          compression_opts=4)
+        fg.create_dataset("dec_enrich", data=de_all, compression="gzip",
+                          compression_opts=4)
+        # Mean/std for quick access
+        fg.create_dataset("z_mean", data=z_mean)
+        fg.create_dataset("z_std", data=z_std)
+        fg.create_dataset("dec_freq_mean", data=df_mean)
+        fg.create_dataset("dec_freq_std", data=df_std)
+        fg.create_dataset("dec_pres_mean", data=dp_mean)
+        fg.create_dataset("dec_pres_std", data=dp_std)
+        fg.create_dataset("dec_enrich_mean", data=de_mean)
+        fg.create_dataset("dec_enrich_std", data=de_std)
+
+        # Per-sequence groups keyed by ID
+        if N_total <= PER_ID_THRESHOLD:
+            bg = hf.create_group("by_id")
+            for i in range(N_total):
+                sid = all_ids[i]
+                sg = bg.create_group(sid)
+                sg.create_dataset("z", data=z_all[i])              # [N_dec, latent]
+                sg.create_dataset("mu", data=mu_all[i])             # [N_dec, latent]
+                sg.create_dataset("dec_freq", data=df_all[i])       # [N_dec, 3]
+                sg.create_dataset("dec_pres", data=dp_all[i])       # [N_dec, 3]
+                sg.create_dataset("dec_enrich", data=de_all[i])     # [N_dec, 3]
+                sg.create_dataset("pooled", data=shared["pooled"][i])  # [d_model]
+                sg.create_dataset("gt_freq", data=shared["gt_freq"][i])  # [3]
+                sg.create_dataset("gt_pres", data=shared["gt_pres"][i])  # [3]
+                if (i + 1) % 100_000 == 0:
+                    log.info("  HDF5 per-ID: %d/%d", i + 1, N_total)
+        else:
+            log.info("  Skipping per-ID groups (N=%d > %d). Use flat/ arrays "
+                     "with flat/ids for lookup.", N_total, PER_ID_THRESHOLD)
+
+    log.info("  HDF5 written in %.1fs", time.time() - t0_h5)
+
+    # ---- Save backward-compatible latents.npz (mean values) ----
+    np.savez_compressed(os.path.join(out_dir, "latents.npz"),
+                        z=z_mean, mu=mu_mean,
+                        dec_freq=df_mean, dec_pres=dp_mean, dec_enrich=de_mean,
+                        z_std=z_std, mu_std=mu_std,
+                        dec_freq_std=df_std, dec_pres_std=dp_std,
+                        dec_enrich_std=de_std,
+                        pooled=shared["pooled"],
+                        gt_freq=shared["gt_freq"], gt_pres=shared["gt_pres"],
+                        num_decoding=N_dec)
+    log.info("Saved latents.npz (mean values)")
+
+    # ---- Save predictions TSV with mean ± std ----
+    tsv_path = os.path.join(out_dir, "predictions.tsv")
+    with open(tsv_path, "w") as f:
+        hdr = ("seq_id\tz_norm_mean\tz_norm_std\t"
+               "dec_freq_R0_mean\tdec_freq_R0_std\t"
+               "dec_freq_R1_mean\tdec_freq_R1_std\t"
+               "dec_freq_R3_mean\tdec_freq_R3_std\t"
+               "dec_pres_R0_mean\tdec_pres_R0_std\t"
+               "dec_pres_R1_mean\tdec_pres_R1_std\t"
+               "dec_pres_R3_mean\tdec_pres_R3_std\t"
+               "dec_enrich_R0_mean\tdec_enrich_R0_std\t"
+               "dec_enrich_R1_mean\tdec_enrich_R1_std\t"
+               "dec_enrich_R3_mean\tdec_enrich_R3_std\t"
+               "num_decoding\n")
+        f.write(hdr)
+        # z_norm per decoding: [N_total, N_dec]
+        z_norms = np.linalg.norm(z_all, axis=2)  # [N, N_dec]
+        zn_mean = z_norms.mean(axis=1)
+        zn_std = z_norms.std(axis=1)
+        for i in range(N_total):
+            sid = all_ids[i] if i < len(all_ids) else str(i)
+            parts = [sid,
+                     f"{zn_mean[i]:.6f}", f"{zn_std[i]:.6f}"]
+            for ri in range(3):
+                parts.extend([f"{df_mean[i,ri]:.6f}", f"{df_std[i,ri]:.6f}"])
+            for ri in range(3):
+                parts.extend([f"{dp_mean[i,ri]:.4f}", f"{dp_std[i,ri]:.4f}"])
+            for ri in range(3):
+                parts.extend([f"{de_mean[i,ri]:.4f}", f"{de_std[i,ri]:.4f}"])
+            parts.append(str(N_dec))
+            f.write("\t".join(parts) + "\n")
+    log.info("Saved predictions TSV: %s", tsv_path)
+
+    # ---- Save decode-order metadata ----
+    meta_path = os.path.join(out_dir, "decoding_meta.json")
+    with open(meta_path, "w") as f:
+        json.dump({
+            "num_decoding": N_dec,
+            "mask_rounds": [ROUND_NAMES[i] for i in mask_rounds],
+            "perm_orders": perms_np.tolist(),
+            "perm_labels": perm_labels,
+            "n_sequences": N_total,
+        }, f, indent=2)
+    log.info("Saved decoding metadata: %s", meta_path)
+    log.info("Inference complete -> %s", out_dir)
 
 
 # =============================================================================
@@ -1479,7 +1728,7 @@ def run_generator(args, meta):
 
 
 # =============================================================================
-# ANALYSIS
+# ANALYSIS (uses mean values from latents.npz)
 # =============================================================================
 def run_analysis(args, meta):
     log.info("=" * 60); log.info("ANALYSIS"); log.info("=" * 60)
@@ -1495,7 +1744,6 @@ def run_analysis(args, meta):
     if os.path.exists(mlm_sp):
         with open(mlm_sp) as f: hist = json.load(f).get("history", {})
 
-        # Individual MLM plots
         mlm_panels = [
             ("train_loss", "val_loss", "MLM CE Loss", "Loss", "mlm_loss.png"),
             ("train_ppl", "val_ppl", "MLM Perplexity (exp(CE))", "PPL", "mlm_perplexity.png"),
@@ -1513,7 +1761,6 @@ def run_analysis(args, meta):
             fig.savefig(os.path.join(out_dir, fname), dpi=150, bbox_inches="tight")
             plt.close(fig); log.info("Saved %s", fname)
 
-        # 4-panel MLM summary
         if all(hist.get(k) for k in ["train_loss","train_ppl","train_top1","train_top5"]):
             fig, axes = plt.subplots(2, 2, figsize=(14, 10))
             for ax, (tk, vk, title, ylabel, _) in zip(axes.flat, mlm_panels):
@@ -1547,7 +1794,6 @@ def run_analysis(args, meta):
     if os.path.exists(av_sp):
         with open(av_sp) as f: hist = json.load(f).get("history", {})
 
-        # Total loss
         if hist.get("train_loss"):
             fig, ax = plt.subplots(figsize=(8, 5))
             ax.plot(hist["train_loss"], label="train", lw=1.5)
@@ -1557,7 +1803,6 @@ def run_analysis(args, meta):
             fig.savefig(os.path.join(out_dir, "av_total_loss.png"), dpi=150, bbox_inches="tight")
             plt.close(fig); log.info("Saved av_total_loss.png")
 
-        # Individual component plots — each in its own figure (different scales)
         comp_plots = [
             ("kl", "KL Divergence", "KL", "av_kl.png"),
             ("vae_seq_recon", "VAE Sequence Reconstruction (CCE)", "Loss", "av_vae_seq_recon.png"),
@@ -1578,7 +1823,6 @@ def run_analysis(args, meta):
             fig.savefig(os.path.join(out_dir, fname), dpi=150, bbox_inches="tight")
             plt.close(fig); log.info("Saved %s", fname)
 
-        # Grouped: autoreg components in one figure
         ar_keys = ["ar_freq", "ar_pres", "ar_enrich"]
         if all(hist.get(k) for k in ar_keys):
             fig, axes = plt.subplots(1, 3, figsize=(18, 5))
@@ -1590,7 +1834,6 @@ def run_analysis(args, meta):
             fig.savefig(os.path.join(out_dir, "av_autoreg_summary.png"), dpi=150, bbox_inches="tight")
             plt.close(fig); log.info("Saved av_autoreg_summary.png")
 
-        # Grouped: VAE recon components
         vae_keys = ["vae_seq_recon", "vae_freq_recon", "vae_pres_recon", "vae_enrich_recon"]
         if all(hist.get(k) for k in vae_keys):
             fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -1603,7 +1846,7 @@ def run_analysis(args, meta):
             fig.savefig(os.path.join(out_dir, "av_vae_recon_summary.png"), dpi=150, bbox_inches="tight")
             plt.close(fig); log.info("Saved av_vae_recon_summary.png")
 
-    # ========== PR / AUC ROC on predicted presence per round ==========
+    # ========== PR / AUC ROC on predicted presence per round (uses mean values) ==========
     lat_path = os.path.join(args.output_dir, "inference", "latents.npz")
     if not os.path.exists(lat_path):
         cd = _ckpt_dir(args)
@@ -1623,22 +1866,30 @@ def run_analysis(args, meta):
 
     if os.path.exists(lat_path) and _has_sklearn:
         lat = np.load(lat_path)
-        pred_pres = lat["dec_pres"]  # [N, 3] predicted presence from autoreg
+        # dec_pres in latents.npz is the mean across decodings
+        pred_pres = lat["dec_pres"] if "dec_pres" in lat else None
+        gt_pres = lat["gt_pres"] if "gt_pres" in lat else None
+        n_dec_used = int(lat["num_decoding"]) if "num_decoding" in lat else 1
 
-        # Collect ground-truth presence from TFRecords
-        gt_pres_list = []
-        for prefix in ["train", "val", "test"]:
-            tfdir = os.path.join(args.output_dir, "tfrecords")
-            if not glob.glob(os.path.join(tfdir, f"{prefix}_*.tfrecord")): continue
-            ds = build_dataset(args, prefix, "inference", shuffle=False)
-            for batch in ds:
-                gt_pres_list.append(batch["pres"].numpy())
-        if gt_pres_list:
-            gt_pres = np.concatenate(gt_pres_list, 0)
+        # Backward compat: old latents.npz may lack gt_pres.
+        # If missing, re-run inference to regenerate with the new format.
+        if gt_pres is None or pred_pres is None:
+            log.warning("latents.npz missing gt_pres or dec_pres — "
+                        "re-running inference to regenerate...")
+            run_inference(args, meta)
+            lat = np.load(lat_path)
+            pred_pres = lat.get("dec_pres", None)
+            gt_pres = lat.get("gt_pres", None)
+            n_dec_used = int(lat["num_decoding"]) if "num_decoding" in lat else 1
+
+        if (gt_pres is not None and pred_pres is not None
+                and len(gt_pres) > 0 and len(pred_pres) > 0):
             n_samples = min(len(gt_pres), len(pred_pres))
             gt_pres, pred_pres = gt_pres[:n_samples], pred_pres[:n_samples]
 
-            # Per-round ROC and PR
+            subtitle = (f"(mean over {n_dec_used} decoding orders)"
+                        if n_dec_used > 1 else "")
+
             fig_roc, axes_roc = plt.subplots(1, 3, figsize=(18, 5))
             fig_pr, axes_pr = plt.subplots(1, 3, figsize=(18, 5))
             for ri, rname in enumerate(ROUND_NAMES):
@@ -1665,45 +1916,71 @@ def run_analysis(args, meta):
                 axes_pr[ri].set_title(f"{rname} Presence PR (AP={ap:.3f})")
                 axes_pr[ri].grid(alpha=0.3)
 
-            fig_roc.suptitle("Autoreg Presence Prediction — ROC per Round", fontsize=14)
+            fig_roc.suptitle(f"Autoreg Presence Prediction — ROC per Round {subtitle}",
+                             fontsize=14)
             fig_roc.tight_layout(rect=[0,0,1,.94])
             fig_roc.savefig(os.path.join(out_dir, "presence_roc_per_round.png"),
                             dpi=150, bbox_inches="tight")
             plt.close(fig_roc)
 
-            fig_pr.suptitle("Autoreg Presence Prediction — PR per Round", fontsize=14)
+            fig_pr.suptitle(f"Autoreg Presence Prediction — PR per Round {subtitle}",
+                            fontsize=14)
             fig_pr.tight_layout(rect=[0,0,1,.94])
             fig_pr.savefig(os.path.join(out_dir, "presence_pr_per_round.png"),
                            dpi=150, bbox_inches="tight")
             plt.close(fig_pr)
             log.info("Saved presence ROC and PR plots")
 
-    # ========== UMAP ==========
+    # ========== UMAP (uses mean z) ==========
     lat_path = os.path.join(args.output_dir, "inference", "latents.npz")
     if os.path.exists(lat_path):
         try:
             import umap
             lat = np.load(lat_path)
-            z = lat.get("z", lat.get("mu", None))
+            z = lat["z"] if "z" in lat else (lat["mu"] if "mu" in lat else None)
+            gt_pres_umap = lat["gt_pres"] if "gt_pres" in lat else None
+            dec_e = lat["dec_enrich"] if "dec_enrich" in lat else None
+            n_dec_used = int(lat["num_decoding"]) if "num_decoding" in lat else 1
+
             if z is not None and len(z) > 100:
-                log.info("Computing UMAP...")
+                log.info("Computing UMAP on mean z (from %d decoding orders)...",
+                         n_dec_used)
                 max_pts = min(50000, len(z))
                 idx = np.random.choice(len(z), max_pts, replace=False)
                 emb = umap.UMAP(n_components=2, random_state=args.seed).fit_transform(z[idx])
 
-                # Color by enrichment and z-norm
-                fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-                dec_e = lat["dec_enrich"]
-                for ri, rname in enumerate(ROUND_NAMES):
-                    sc = axes[ri].scatter(emb[:,0], emb[:,1],
-                                          c=np.log1p(dec_e[idx, ri]),
-                                          cmap="viridis", s=1, alpha=0.5)
-                    axes[ri].set_title(f"UMAP — log(1+enrichment_{rname})")
-                    plt.colorbar(sc, ax=axes[ri])
-                fig.tight_layout()
-                fig.savefig(os.path.join(out_dir, "umap_latent.png"), dpi=150, bbox_inches="tight")
-                plt.close(fig)
-                np.savez_compressed(os.path.join(out_dir, "umap_coords.npz"), coords=emb, indices=idx)
+                subtitle = (f" (mean of {n_dec_used} decodings)"
+                            if n_dec_used > 1 else "")
+
+                if dec_e is not None:
+                    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+                    for ri, rname in enumerate(ROUND_NAMES):
+                        sc = axes[ri].scatter(emb[:,0], emb[:,1],
+                                              c=np.log1p(dec_e[idx, ri]),
+                                              cmap="viridis", s=1, alpha=0.5)
+                        axes[ri].set_title(
+                            f"UMAP — log(1+enrichment_{rname}){subtitle}")
+                        plt.colorbar(sc, ax=axes[ri])
+                    fig.tight_layout()
+                    fig.savefig(os.path.join(out_dir, "umap_enrichment.png"),
+                                dpi=150, bbox_inches="tight")
+                    plt.close(fig)
+
+                if gt_pres_umap is not None:
+                    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+                    for ri, rname in enumerate(ROUND_NAMES):
+                        sc = axes[ri].scatter(emb[:,0], emb[:,1],
+                                              c=gt_pres_umap[idx, ri],
+                                              cmap="RdYlGn", s=1, alpha=0.5)
+                        axes[ri].set_title(f"UMAP — {rname} presence")
+                        plt.colorbar(sc, ax=axes[ri])
+                    fig.tight_layout()
+                    fig.savefig(os.path.join(out_dir, "umap_presence.png"),
+                                dpi=150, bbox_inches="tight")
+                    plt.close(fig)
+
+                np.savez_compressed(os.path.join(out_dir, "umap_coords.npz"),
+                                    coords=emb, indices=idx)
                 log.info("Saved UMAP plot")
         except ImportError:
             log.warning("umap-learn not installed — skipping UMAP.")
