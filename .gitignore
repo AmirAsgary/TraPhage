@@ -1,1 +1,6 @@
 data/
+tfrecords/
+tfrecord*
+test
+*test*
+*tmp*
