@@ -1,51 +1,40 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-Nanobody Phage Display Pipeline — MLM + Autoregressive VAE (v3.3)
+Nanobody Phage Display Pipeline — MLM + Autoregressive VAE (v3.4)
 ================================================================================
-End-to-end pipeline:
-  Stage 1 — MLM: Masked language model pretraining on R0 sequences.
-  Stage 2 — Autoregressive VAE: Random-order autoregressive decoding of
-            round presence/frequency/enrichment with partial masking,
-            followed by VAE reconstruction.
-
-Enrichment:
-  E_R0 = 1.0 (identity), E_R1 = freq_R1/freq_R0, E_R3 = freq_R3/freq_R0.
-
-v3.3 changes:
-  --num_decoding N: run inference with N random decoding orders, save all
-  per-sequence outputs in HDF5 (keyed by sequence ID), report mean±std in
-  TSV, and use mean values for analysis plots.
-
-Usage examples:
-  python pipeline.py --r0_train r0.fa --r1_train r1.fa --r3_train r3.fa \
-      --output_dir out --mlm --epochs 20
-
-  python pipeline.py --r0_train r0.fa --r1_train r1.fa --r3_train r3.fa \
-      --output_dir out --autoregressive_vae --epochs 50
-
-  python pipeline.py --r0_train r0.fa --r1_train r1.fa --r3_train r3.fa \
-      --output_dir out --inference --inference_mask_rounds R1,R3 --num_decoding 10
-
-  python pipeline.py --r0_train r0.fa --r1_train r1.fa --r3_train r3.fa \
-      --output_dir out --generator --n_generate 1000
-
-  python pipeline.py --r0_train r0.fa --r1_train r1.fa --r3_train r3.fa \
-      --output_dir out --analysis
+v3.4 changes vs v3.3:
+  - Removed frequency as a learned/predicted target throughout.
+    Frequency is still read from TFRecords and used ONLY to compute enrichment
+    ratios (freq_R1/freq_R0, freq_R3/freq_R0). It is never predicted, never
+    reconstructed, and never passed as a feature into the autoregressive state.
+  - AutoregressiveDecoder:
+      * FULL_SLOT reduced from 4 -> 3  (dropped freq slot)
+        full_state layout: [pres, enrich, is_decoded] x 3 rounds = 9 dims
+      * fe_net renamed to e_net, now predicts only enrichment (1 value, not 2)
+      * loss_freq removed; ar_loss_freq removed from outputs
+  - VAEEncoder: dec_freq inputs removed; input = seq_embed(32) + pres+enrich x3 = 38
+  - VAEDecoder: round_head now outputs 6 values (pres_logit + enrich) x 3 rounds
+    instead of 9; freq reconstruction head removed entirely
+  - vae_recon_losses: freq_loss removed
+  - train_autoreg_vae: l_vae_freq, a_vae_freq, ar_loss_freq removed
+  - Inference/Generator/Analysis: dec_freq/recon_freq outputs removed where
+    they were predicted quantities; gt_freq still saved for reference
+  - predictions.tsv: dec_freq columns removed
+  - History keys: ar_freq and vae_freq_recon removed
 ================================================================================
 """
 
 import os, sys, glob, math, time, json, random, logging, argparse
 import numpy as np
 
-# --- GPU config MUST happen before any TF op triggers context init ---
 import tensorflow as tf
 _gpus = tf.config.list_physical_devices("GPU")
 for _g in _gpus:
     try:
         tf.config.experimental.set_memory_growth(_g, True)
     except RuntimeError:
-        pass  # already initialized
+        pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -59,9 +48,9 @@ PAD, MASK, UNK = 20, 21, 22
 VOCAB = 23
 N_AA = 20
 ROUND_NAMES = ["R0", "R1", "R3"]
-ENRICH_EPS = 1e-8   # epsilon for enrichment division
-ENRICH_CLIP = 100.0 # max enrichment ratio (prevents NaN from tiny freq_R0)
-LOGVAR_CLIP = 10.0  # max logvar in VAE (exp(5)=148, safe from overflow)
+ENRICH_EPS = 1e-8
+ENRICH_CLIP = 100.0
+LOGVAR_CLIP = 10.0
 
 BLOSUM62 = np.array([
     [ 4, 0,-2,-1,-2, 0,-2,-1,-1,-1,-1,-2,-1,-1,-1, 1, 0, 0,-3,-2],
@@ -101,7 +90,7 @@ ALL_PERMS_NP = ALL_PERMS.numpy()
 # =============================================================================
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Nanobody Pipeline v3.3: MLM + Autoregressive VAE",
+        description="Nanobody Pipeline v3.4: MLM + Autoregressive VAE (no freq prediction)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     g = p.add_argument_group("Data")
     g.add_argument("--r0_train", required=True); g.add_argument("--r1_train", required=True)
@@ -166,9 +155,7 @@ def parse_args():
     g7.add_argument("--inference_mask_rounds", type=str, default="",
                     help="Comma-sep rounds to mask, e.g. 'R1,R3'.")
     g7.add_argument("--num_decoding", type=int, default=1,
-                    help="Number of random decoding orders for inference. "
-                         "Each uses a different permutation of [R0,R1,R3]. "
-                         "Results saved per-sequence in HDF5; TSV reports mean±std.")
+                    help="Number of random decoding orders for inference.")
     g7.add_argument("--n_generate", type=int, default=100)
     g8 = p.add_argument_group("Performance")
     g8.add_argument("--mixed_precision", action="store_true")
@@ -192,20 +179,20 @@ def get_reg(args):
 
 def compute_enrichment(freq, use_log=False):
     """Compute enrichment from freq [B,3]. E_R0=1, E_R1=f1/f0, E_R3=f3/f0.
-    Clipped to [0, ENRICH_CLIP] to prevent NaN from tiny freq_R0.
-    If use_log, returns log(E + eps) so E_R0≈0, E_R1=log(f1/f0+eps), etc."""
+    freq is used ONLY here — never passed further as a feature or target."""
     f0 = tf.maximum(freq[:, 0:1], ENRICH_EPS)
     e0 = tf.ones_like(freq[:, 0:1])
     e1 = tf.clip_by_value(freq[:, 1:2] / f0, 0.0, ENRICH_CLIP)
     e3 = tf.clip_by_value(freq[:, 2:3] / f0, 0.0, ENRICH_CLIP)
     e = tf.concat([e0, e1, e3], axis=1)  # [B, 3]
     if use_log:
-        e = tf.math.log(e + ENRICH_EPS)  # E_R0 -> log(1+eps) ≈ 0
+        e = tf.math.log(e + ENRICH_EPS)
     return e
 
 
 # =============================================================================
 # DATA LOADING & TFRECORD I/O
+# (unchanged — freq still stored in TFRecords for enrichment computation)
 # =============================================================================
 def parse_fasta(path):
     sid, cnt, parts = None, None, []
@@ -273,7 +260,7 @@ def write_tfrecords(data, indices, out_dir, prefix, n_shards, max_len):
                 feat = {"sid": _bf(sid),
                         "seq": _bf(data["seqs"][idx].tobytes()),
                         "slen": _if(int(data["slens"][idx])),
-                        "freq": _bf(data["freq"][idx].tobytes()),
+                        "freq": _bf(data["freq"][idx].tobytes()),  # kept for enrichment calc
                         "pres": _bf(data["pres"][idx].tobytes())}
                 w.write(tf.train.Example(
                     features=tf.train.Features(feature=feat)).SerializeToString())
@@ -330,7 +317,7 @@ def load_meta(args):
 
 
 # =============================================================================
-# TF.DATA PIPELINES
+# TF.DATA PIPELINES  (unchanged)
 # =============================================================================
 def _parse_ex(raw, max_len):
     p = tf.io.parse_single_example(raw, {
@@ -418,7 +405,7 @@ def build_dataset(args, prefix, mode, shuffle=True):
 
 
 # =============================================================================
-# CUSTOM LAYERS
+# CUSTOM LAYERS  (unchanged)
 # =============================================================================
 class BLOSUM62Embed(tf.keras.layers.Layer):
     def __init__(self, d_model, reg=None, **kw):
@@ -555,7 +542,7 @@ class SeqEncoder(tf.keras.layers.Layer):
 
 
 # =============================================================================
-# MLM MODEL
+# MLM MODEL  (unchanged)
 # =============================================================================
 class MLMModel(tf.keras.Model):
     def __init__(self, args, **kw):
@@ -579,41 +566,39 @@ class MLMModel(tf.keras.Model):
 
 
 # =============================================================================
-# AUTOREGRESSIVE DECODER (with enrichment)
+# AUTOREGRESSIVE DECODER — v3.4: freq removed
 # =============================================================================
 class AutoregressiveDecoder(tf.keras.layers.Layer):
-    """Random-order autoregressive decoder with separated heads.
+    """Random-order autoregressive decoder. Frequency REMOVED as feature/target.
 
-    Two independent prediction paths to prevent information leakage:
+    Two independent prediction paths:
 
     1. Presence head (pres_net):
-       Input: seq_embed + pres_state (6) + round_onehot (3)
-       Only sees: sequence embedding, round identity, and previously decoded
-       presence probabilities. NO access to frequency or enrichment.
-       Output: presence logit (1 value).
+       Input: seq_embed + pres_state(6) + round_onehot(3)
+       Output: presence logit (1 value)
 
-    2. Frequency/Enrichment head (fe_net):
-       Input: seq_embed + full_state (12) + round_onehot (3)
-       Sees everything: sequence embedding, round identity, and all previously
-       decoded values (presence, frequency, enrichment).
-       Output: frequency and enrichment (2 values).
+    2. Enrichment head (e_net):  [renamed from fe_net, freq output dropped]
+       Input: seq_embed + enrich_state(9) + round_onehot(3)
+       Output: enrichment (1 value)
 
     State layouts:
-      pres_state: [R0_pres, R0_decoded, R1_pres, R1_decoded, R3_pres, R3_decoded] = 6
-      full_state: [R0_freq, R0_pres, R0_enrich, R0_decoded, R1_..., R3_...] = 12
+      pres_state:   [R0_pres, R0_decoded, R1_pres, R1_decoded, R3_pres, R3_decoded] = 6
+      enrich_state: [R0_pres, R0_enrich, R0_decoded,
+                     R1_pres, R1_enrich, R1_decoded,
+                     R3_pres, R3_enrich, R3_decoded] = 9
     """
-    PRES_SLOT = 2   # per-round in pres_state: [pres_val, is_decoded]
-    FULL_SLOT = 4   # per-round in full_state: [freq, pres, enrich, is_decoded]
-    N_ROUNDS = 3
-    PRES_STATE_DIM = PRES_SLOT * N_ROUNDS   # 6
-    FULL_STATE_DIM = FULL_SLOT * N_ROUNDS   # 12
+    PRES_SLOT   = 2   # [pres_val, is_decoded]
+    ENRICH_SLOT = 3   # [pres_val, enrich_val, is_decoded]   <-- was FULL_SLOT=4
+    N_ROUNDS    = 3
+    PRES_STATE_DIM   = PRES_SLOT   * N_ROUNDS   # 6
+    ENRICH_STATE_DIM = ENRICH_SLOT * N_ROUNDS   # 9  (was 12)
 
     def __init__(self, d_model, hidden_dim, mask_rate=0.5, dropout=0.1,
                  reg=None, **kw):
         super().__init__(**kw)
         self.mask_rate = mask_rate
 
-        # Presence head: seq_embed + pres_state(6) + round_oh(3) -> 1
+        # Presence head: seq_embed(d) + pres_state(6) + round_oh(3) -> 1
         self.pres_net = tf.keras.Sequential([
             tf.keras.layers.Dense(hidden_dim, activation="gelu", kernel_regularizer=reg),
             tf.keras.layers.Dropout(dropout),
@@ -621,63 +606,55 @@ class AutoregressiveDecoder(tf.keras.layers.Layer):
             tf.keras.layers.Dense(1, kernel_regularizer=reg),
         ], name="pres_net")
 
-        # Freq/enrichment head: seq_embed + full_state(12) + round_oh(3) -> 2
-        self.fe_net = tf.keras.Sequential([
+        # Enrichment head: seq_embed(d) + enrich_state(9) + round_oh(3) -> 1
+        self.e_net = tf.keras.Sequential([
             tf.keras.layers.Dense(hidden_dim, activation="gelu", kernel_regularizer=reg),
             tf.keras.layers.Dropout(dropout),
             tf.keras.layers.Dense(hidden_dim, activation="gelu", kernel_regularizer=reg),
-            tf.keras.layers.Dense(2, kernel_regularizer=reg),  # [freq, enrich]
-        ], name="fe_net")
+            tf.keras.layers.Dense(1, kernel_regularizer=reg),  # enrichment only
+        ], name="e_net")
 
-    def _decode_steps(self, seq_embed, freq, pres, enrich, round_mask, perms,
-                      training):
-        """Core autoregressive loop with separated heads."""
+    def _decode_steps(self, seq_embed, pres, enrich, round_mask, perms, training):
+        """Core autoregressive loop. freq removed from state and losses."""
         B = tf.shape(seq_embed)[0]
         bi = tf.range(B)
-        PS, FS = self.PRES_SLOT, self.FULL_SLOT
+        PS, ES = self.PRES_SLOT, self.ENRICH_SLOT
 
-        pres_state = tf.zeros([B, self.PRES_STATE_DIM])   # [B, 6]
-        full_state = tf.zeros([B, self.FULL_STATE_DIM])    # [B, 12]
+        pres_state   = tf.zeros([B, self.PRES_STATE_DIM])    # [B, 6]
+        enrich_state = tf.zeros([B, self.ENRICH_STATE_DIM])  # [B, 9]
 
-        loss_freq = tf.constant(0.0)
-        loss_pres = tf.constant(0.0)
+        loss_pres   = tf.constant(0.0)
         loss_enrich = tf.constant(0.0)
-        n_masked = tf.constant(0.0)
+        n_masked    = tf.constant(0.0)
 
-        dec_freq = tf.TensorArray(tf.float32, size=3)
-        dec_pres = tf.TensorArray(tf.float32, size=3)
+        dec_pres   = tf.TensorArray(tf.float32, size=3)
         dec_enrich = tf.TensorArray(tf.float32, size=3)
         for r in range(3):
-            dec_freq = dec_freq.write(r, tf.zeros([B]))
-            dec_pres = dec_pres.write(r, tf.zeros([B]))
+            dec_pres   = dec_pres.write(r, tf.zeros([B]))
             dec_enrich = dec_enrich.write(r, tf.zeros([B]))
 
         for step in range(3):
             ridx = perms[:, step]
             r_oh = tf.one_hot(ridx, 3)  # [B, 3]
 
-            gt_f = tf.gather_nd(freq, tf.stack([bi, ridx], 1))
-            gt_p = tf.gather_nd(pres, tf.stack([bi, ridx], 1))
+            gt_p = tf.gather_nd(pres,   tf.stack([bi, ridx], 1))
             gt_e = tf.gather_nd(enrich, tf.stack([bi, ridx], 1))
-            m = tf.gather_nd(round_mask, tf.stack([bi, ridx], 1))
+            m    = tf.gather_nd(round_mask, tf.stack([bi, ridx], 1))
 
-            # --- Presence prediction (isolated: no freq/enrich info) ---
-            pres_inp = tf.concat([seq_embed, pres_state, r_oh], 1)
-            pp_logit = self.pres_net(pres_inp, training=training)[:, 0]
+            # --- Presence prediction ---
+            pres_inp  = tf.concat([seq_embed, pres_state, r_oh], 1)
+            pp_logit  = self.pres_net(pres_inp, training=training)[:, 0]
 
-            # --- Freq/Enrichment prediction (full context) ---
-            fe_inp = tf.concat([seq_embed, full_state, r_oh], 1)
-            fe_pred = self.fe_net(fe_inp, training=training)
-            pf, pe = fe_pred[:, 0], fe_pred[:, 1]
+            # --- Enrichment prediction ---
+            e_inp = tf.concat([seq_embed, enrich_state, r_oh], 1)
+            pe    = self.e_net(e_inp, training=training)[:, 0]
 
             # Losses (masked positions only)
-            loss_freq += tf.reduce_sum(tf.square(pf - gt_f) * m)
             loss_pres += tf.reduce_sum(
                 tf.nn.sigmoid_cross_entropy_with_logits(labels=gt_p, logits=pp_logit) * m)
             loss_enrich += tf.reduce_sum(tf.square(pe - gt_e) * m)
-            n_masked += tf.reduce_sum(m)
+            n_masked    += tf.reduce_sum(m)
 
-            act_f = tf.where(m > 0.5, tf.clip_by_value(pf, -10.0, 10.0), gt_f)
             act_p = tf.where(m > 0.5, tf.nn.sigmoid(pp_logit), gt_p)
             act_e = tf.where(m > 0.5, tf.clip_by_value(pe, -ENRICH_CLIP, ENRICH_CLIP), gt_e)
 
@@ -689,87 +666,78 @@ class AutoregressiveDecoder(tf.keras.layers.Layer):
                 p_slots[r] = p_slots[r] * (1.0 - is_r) + new_pres_slot * is_r
             pres_state = tf.concat(p_slots, 1)
 
-            # Update full state
-            new_full_slot = tf.stack([act_f, act_p, act_e, tf.ones([B])], 1)
-            f_slots = [full_state[:, r*FS:(r+1)*FS] for r in range(3)]
+            # Update enrichment state  (pres + enrich + decoded flag)
+            new_enrich_slot = tf.stack([act_p, act_e, tf.ones([B])], 1)
+            e_slots = [enrich_state[:, r*ES:(r+1)*ES] for r in range(3)]
             for r in range(3):
                 is_r = tf.cast(tf.equal(ridx, r), tf.float32)[:, None]
-                f_slots[r] = f_slots[r] * (1.0 - is_r) + new_full_slot * is_r
-            full_state = tf.concat(f_slots, 1)
+                e_slots[r] = e_slots[r] * (1.0 - is_r) + new_enrich_slot * is_r
+            enrich_state = tf.concat(e_slots, 1)
 
             for r in range(3):
                 is_r = tf.cast(tf.equal(ridx, r), tf.float32)
-                dec_freq = dec_freq.write(r, dec_freq.read(r)*(1.-is_r) + act_f*is_r)
-                dec_pres = dec_pres.write(r, dec_pres.read(r)*(1.-is_r) + act_p*is_r)
+                dec_pres   = dec_pres.write(r,   dec_pres.read(r)  *(1.-is_r) + act_p*is_r)
                 dec_enrich = dec_enrich.write(r, dec_enrich.read(r)*(1.-is_r) + act_e*is_r)
 
         nm = n_masked + 1e-8
-        d_f = tf.stack([dec_freq.read(r) for r in range(3)], 1)
-        d_p = tf.stack([dec_pres.read(r) for r in range(3)], 1)
+        d_p = tf.stack([dec_pres.read(r)   for r in range(3)], 1)
         d_e = tf.stack([dec_enrich.read(r) for r in range(3)], 1)
-        return loss_freq/nm, loss_pres/nm, loss_enrich/nm, d_f, d_p, d_e
+        return loss_pres/nm, loss_enrich/nm, d_p, d_e
 
-    def call(self, seq_embed, freq, pres, enrich, training=False):
+    def call(self, seq_embed, pres, enrich, training=False):
         """Training forward: random permutation + random masking."""
         B = tf.shape(seq_embed)[0]
-        perm_idx = tf.random.uniform([B], 0, 6, tf.int32)
-        perms = tf.gather(ALL_PERMS, perm_idx)
+        perm_idx   = tf.random.uniform([B], 0, 6, tf.int32)
+        perms      = tf.gather(ALL_PERMS, perm_idx)
         round_mask = tf.cast(tf.random.uniform([B, 3]) < self.mask_rate, tf.float32)
-        lf, lp, le, df, dp, de = self._decode_steps(
-            seq_embed, freq, pres, enrich, round_mask, perms, training)
-        return {"ar_loss_freq": lf, "ar_loss_pres": lp, "ar_loss_enrich": le,
-                "dec_freq": df, "dec_pres": dp, "dec_enrich": de}
+        lp, le, dp, de = self._decode_steps(
+            seq_embed, pres, enrich, round_mask, perms, training)
+        return {"ar_loss_pres": lp, "ar_loss_enrich": le,
+                "dec_pres": dp, "dec_enrich": de}
 
-    def predict_with_mask(self, seq_embed, freq, pres, enrich, round_mask_vec,
-                          perms=None):
-        """Inference: decode with given mask and optional custom permutations.
-
-        Args:
-            seq_embed: [B, d_model] encoder pooled output.
-            freq, pres, enrich: [B, 3] ground-truth values.
-            round_mask_vec: [B, 3] float, 1.0 = predict (masked), 0.0 = use GT.
-            perms: [B, 3] int32 permutation orders, or None for canonical [0,1,2].
-
-        Returns:
-            dict with dec_freq, dec_pres, dec_enrich [B, 3].
-        """
+    def predict_with_mask(self, seq_embed, pres, enrich, round_mask_vec, perms=None):
+        """Inference decode with given mask and optional custom permutations."""
         B = tf.shape(seq_embed)[0]
         if perms is None:
             perms = tf.tile(tf.constant([[0,1,2]], tf.int32), [B, 1])
-        _, _, _, df, dp, de = self._decode_steps(
-            seq_embed, freq, pres, enrich, round_mask_vec, perms, training=False)
-        return {"dec_freq": df, "dec_pres": dp, "dec_enrich": de}
+        _, _, dp, de = self._decode_steps(
+            seq_embed, pres, enrich, round_mask_vec, perms, training=False)
+        return {"dec_pres": dp, "dec_enrich": de}
 
 
 # =============================================================================
-# VAE (with enrichment)
+# VAE — v3.4: freq removed from encoder input and decoder output
 # =============================================================================
 class VAEEncoder(tf.keras.layers.Layer):
+    """Input: seq_embed(d_model) + [pres, enrich] x 3 rounds = d_model + 6."""
     def __init__(self, d_model, hidden_dim, latent_dim, dropout=0.1, reg=None, **kw):
         super().__init__(**kw)
         self.fc = tf.keras.Sequential([
             tf.keras.layers.Dense(hidden_dim, activation="gelu", kernel_regularizer=reg),
             tf.keras.layers.Dropout(dropout),
         ], name="vae_enc_fc")
-        self.mu_layer = tf.keras.layers.Dense(latent_dim, kernel_regularizer=reg, name="mu")
+        self.mu_layer     = tf.keras.layers.Dense(latent_dim, kernel_regularizer=reg, name="mu")
         self.logvar_layer = tf.keras.layers.Dense(latent_dim, kernel_regularizer=reg, name="logvar")
 
-    def call(self, seq_embed, dec_freq, dec_pres, dec_enrich, training=False):
+    def call(self, seq_embed, dec_pres, dec_enrich, training=False):
+        # freq removed — input is seq_embed + pres + enrich for each of 3 rounds
         x = tf.concat([
             seq_embed,
-            dec_freq[:, 0:1], dec_pres[:, 0:1], dec_enrich[:, 0:1],
-            dec_freq[:, 1:2], dec_pres[:, 1:2], dec_enrich[:, 1:2],
-            dec_freq[:, 2:3], dec_pres[:, 2:3], dec_enrich[:, 2:3],
-        ], axis=1)
-        h = self.fc(x, training=training)
-        mu = self.mu_layer(h)
+            dec_pres[:, 0:1],   dec_enrich[:, 0:1],
+            dec_pres[:, 1:2],   dec_enrich[:, 1:2],
+            dec_pres[:, 2:3],   dec_enrich[:, 2:3],
+        ], axis=1)   # [B, d_model + 6]
+        h      = self.fc(x, training=training)
+        mu     = self.mu_layer(h)
         logvar = tf.clip_by_value(self.logvar_layer(h), -LOGVAR_CLIP, LOGVAR_CLIP)
-        eps = tf.random.normal(tf.shape(mu))
-        z = mu + tf.exp(0.5 * logvar) * eps
+        eps    = tf.random.normal(tf.shape(mu))
+        z      = mu + tf.exp(0.5 * logvar) * eps
         return z, mu, logvar
 
 
 class VAEDecoder(tf.keras.layers.Layer):
+    """Output: seq reconstruction + [pres_logit, enrich] x 3 rounds (6 values).
+    freq reconstruction removed."""
     def __init__(self, latent_dim, hidden_dim, max_len, dropout=0.1, reg=None, **kw):
         super().__init__(**kw)
         self.max_len = max_len
@@ -778,22 +746,23 @@ class VAEDecoder(tf.keras.layers.Layer):
             tf.keras.layers.Dropout(dropout),
             tf.keras.layers.Dense(hidden_dim, activation="gelu", kernel_regularizer=reg),
         ], name="vae_dec_fc")
-        self.seq_head = tf.keras.layers.Dense(max_len * N_AA, kernel_regularizer=reg,
-                                              name="seq_recon")
-        self.round_head = tf.keras.layers.Dense(9, kernel_regularizer=reg, name="round_recon")
+        self.seq_head   = tf.keras.layers.Dense(max_len * N_AA, kernel_regularizer=reg,
+                                                name="seq_recon")
+        # 6 outputs: [pres_logit, enrich] x 3 rounds  (was 9 with freq)
+        self.round_head = tf.keras.layers.Dense(6, kernel_regularizer=reg, name="round_recon")
 
     def call(self, z, training=False):
-        h = self.fc(z, training=training)
+        h          = self.fc(z, training=training)
         seq_logits = tf.reshape(self.seq_head(h), [-1, self.max_len, N_AA])
-        rout = self.round_head(h)
-        recon_freq = tf.stack([rout[:,0], rout[:,3], rout[:,6]], 1)
-        recon_pres_logit = tf.stack([rout[:,1], rout[:,4], rout[:,7]], 1)
-        recon_enrich = tf.stack([rout[:,2], rout[:,5], rout[:,8]], 1)
-        return seq_logits, recon_freq, recon_pres_logit, recon_enrich
+        rout       = self.round_head(h)   # [B, 6]
+        # layout: R0_pres(0), R0_enrich(1), R1_pres(2), R1_enrich(3), R3_pres(4), R3_enrich(5)
+        recon_pres_logit = tf.stack([rout[:,0], rout[:,2], rout[:,4]], 1)
+        recon_enrich     = tf.stack([rout[:,1], rout[:,3], rout[:,5]], 1)
+        return seq_logits, recon_pres_logit, recon_enrich
 
 
 # =============================================================================
-# FULL AUTOREG-VAE MODEL
+# FULL AUTOREG-VAE MODEL — v3.4
 # =============================================================================
 class AutoregVAEModel(tf.keras.Model):
     def __init__(self, args, **kw):
@@ -824,64 +793,46 @@ class AutoregVAEModel(tf.keras.Model):
             inputs["mlm_input"], inputs["padding_mask"], training=training)
         mlm_logits = self.mlm_head(per_res, training=training)
 
+        # freq used ONLY to compute enrichment — not passed further
         enrich = compute_enrichment(inputs["freq"], self._log_enrich)
-        ar_out = self.autoreg(pooled, inputs["freq"], inputs["pres"],
-                              enrich, training=training)
 
+        # autoreg no longer receives freq
+        ar_out = self.autoreg(pooled, inputs["pres"], enrich, training=training)
+
+        # VAE encoder no longer receives dec_freq
         z, mu, logvar = self.vae_enc(
-            pooled, ar_out["dec_freq"], ar_out["dec_pres"],
-            ar_out["dec_enrich"], training=training)
-        seq_logits, recon_freq, recon_pres_logit, recon_enrich = self.vae_dec(
-            z, training=training)
+            pooled, ar_out["dec_pres"], ar_out["dec_enrich"], training=training)
+
+        seq_logits, recon_pres_logit, recon_enrich = self.vae_dec(z, training=training)
 
         return {
-            "mlm_logits": mlm_logits,
-            "ar_loss_freq": ar_out["ar_loss_freq"],
-            "ar_loss_pres": ar_out["ar_loss_pres"],
-            "ar_loss_enrich": ar_out["ar_loss_enrich"],
+            "mlm_logits":        mlm_logits,
+            "ar_loss_pres":      ar_out["ar_loss_pres"],
+            "ar_loss_enrich":    ar_out["ar_loss_enrich"],
             "z": z, "mu": mu, "logvar": logvar,
-            "seq_logits": seq_logits,
-            "recon_freq": recon_freq,
-            "recon_pres_logit": recon_pres_logit,
-            "recon_enrich": recon_enrich,
-            "dec_freq": ar_out["dec_freq"],
-            "dec_pres": ar_out["dec_pres"],
-            "dec_enrich": ar_out["dec_enrich"],
+            "seq_logits":        seq_logits,
+            "recon_pres_logit":  recon_pres_logit,
+            "recon_enrich":      recon_enrich,
+            "dec_pres":          ar_out["dec_pres"],
+            "dec_enrich":        ar_out["dec_enrich"],
         }
 
-    def encode_to_latent(self, ids, pmask, freq, pres, round_mask_vec=None,
-                         perms=None):
-        """Encode sequences to latent space with optional custom decode order.
-
-        Args:
-            ids: [B, L] int32 token IDs.
-            pmask: [B, L] float32 padding mask.
-            freq, pres: [B, 3] ground-truth frequency and presence.
-            round_mask_vec: [B, 3] float, 1.0 = predict, 0.0 = use GT. None → all GT.
-            perms: [B, 3] int32 decoding order, or None for canonical [0,1,2].
-
-        Returns:
-            dict with z, mu, pooled, dec_freq, dec_pres, dec_enrich.
-        """
+    def encode_to_latent(self, ids, pmask, freq, pres, round_mask_vec=None, perms=None):
         pooled, _ = self.encoder(ids, pmask, training=False)
         enrich = compute_enrichment(freq, self._log_enrich)
         if round_mask_vec is None:
-            round_mask_vec = tf.zeros_like(freq)
-        ar = self.autoreg.predict_with_mask(pooled, freq, pres, enrich,
-                                            round_mask_vec, perms=perms)
-        z, mu, logvar = self.vae_enc(
-            pooled, ar["dec_freq"], ar["dec_pres"], ar["dec_enrich"],
-            training=False)
+            round_mask_vec = tf.zeros_like(pres)
+        ar = self.autoreg.predict_with_mask(pooled, pres, enrich, round_mask_vec, perms=perms)
+        z, mu, logvar = self.vae_enc(pooled, ar["dec_pres"], ar["dec_enrich"], training=False)
         return {"z": z, "mu": mu, "pooled": pooled,
-                "dec_freq": ar["dec_freq"], "dec_pres": ar["dec_pres"],
-                "dec_enrich": ar["dec_enrich"]}
+                "dec_pres": ar["dec_pres"], "dec_enrich": ar["dec_enrich"]}
 
     def generate_from_z(self, z):
         return self.vae_dec(z, training=False)
 
 
 # =============================================================================
-# LOSS FUNCTIONS
+# LOSS FUNCTIONS — v3.4: freq_loss removed
 # =============================================================================
 def mlm_loss(logits, original_ids, mask_flag):
     labels = tf.clip_by_value(tf.cast(original_ids, tf.int32), 0, 19)
@@ -890,18 +841,17 @@ def mlm_loss(logits, original_ids, mask_flag):
 
 
 def vae_recon_losses(seq_logits, original_ids, padding_mask,
-                     recon_freq, true_freq,
                      recon_pres_logit, true_pres,
                      recon_enrich, true_enrich):
-    labels = tf.clip_by_value(tf.cast(original_ids, tf.int32), 0, 19)
-    seq_ce = tf.keras.losses.sparse_categorical_crossentropy(
+    """freq_loss removed — only seq, pres, enrich reconstruction."""
+    labels   = tf.clip_by_value(tf.cast(original_ids, tf.int32), 0, 19)
+    seq_ce   = tf.keras.losses.sparse_categorical_crossentropy(
         labels, seq_logits, from_logits=True)
     seq_loss = tf.reduce_sum(seq_ce * padding_mask) / (tf.reduce_sum(padding_mask) + 1e-8)
-    freq_loss = tf.reduce_mean(tf.square(recon_freq - true_freq))
-    pres_loss = tf.reduce_mean(
+    pres_loss   = tf.reduce_mean(
         tf.nn.sigmoid_cross_entropy_with_logits(labels=true_pres, logits=recon_pres_logit))
     enrich_loss = tf.reduce_mean(tf.square(recon_enrich - true_enrich))
-    return seq_loss, freq_loss, pres_loss, enrich_loss
+    return seq_loss, pres_loss, enrich_loss
 
 
 def kl_divergence(mu, logvar):
@@ -909,7 +859,7 @@ def kl_divergence(mu, logvar):
 
 
 # =============================================================================
-# LR SCHEDULE & OPTIMIZER
+# LR SCHEDULE & OPTIMIZER  (unchanged)
 # =============================================================================
 class WarmupCosine(tf.keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, peak, warmup, total):
@@ -936,7 +886,7 @@ def make_optimizer(args, total_steps):
 
 
 # =============================================================================
-# CHECKPOINT / STATE
+# CHECKPOINT / STATE  (unchanged)
 # =============================================================================
 def _ckpt_dir(args): return os.path.join(args.output_dir, "checkpoints")
 
@@ -1012,58 +962,58 @@ def _save_generator(args, model):
 
 
 # =============================================================================
-# TRAINING: MLM
+# TRAINING: MLM  (unchanged)
 # =============================================================================
 def train_mlm(args, meta):
     log.info("=" * 60); log.info("STAGE: MLM PRETRAINING (R0 only)"); log.info("=" * 60)
     n_train, n_val = meta["n_train"], meta["n_val"]
     spe = max(1, n_train // args.batch_size)
-    vs = max(1, n_val // args.batch_size)
+    vs  = max(1, n_val   // args.batch_size)
     total = spe * args.epochs
     log.info("n_train=%d n_val=%d spe=%d total=%d bs=%d",
              n_train, n_val, spe, total, args.batch_size)
     train_ds = build_dataset(args, "train", "mlm", shuffle=True)
-    val_ds = build_dataset(args, "val", "mlm", shuffle=False)
-    model = _init_model(MLMModel, args, _mlm_dummy(args))
+    val_ds   = build_dataset(args, "val",   "mlm", shuffle=False)
+    model    = _init_model(MLMModel, args, _mlm_dummy(args))
     model.summary(print_fn=log.info)
     opt = make_optimizer(args, total); gc = args.grad_clip
 
-    loss_acc = tf.Variable(0.0, trainable=False)
-    step_acc = tf.Variable(0, trainable=False, dtype=tf.int32)
-    acc1_acc = tf.Variable(0.0, trainable=False)
-    acc5_acc = tf.Variable(0.0, trainable=False)
+    loss_acc  = tf.Variable(0.0, trainable=False)
+    step_acc  = tf.Variable(0,   trainable=False, dtype=tf.int32)
+    acc1_acc  = tf.Variable(0.0, trainable=False)
+    acc5_acc  = tf.Variable(0.0, trainable=False)
     nmask_acc = tf.Variable(0.0, trainable=False)
 
     @tf.function(jit_compile=args.xla)
     def train_step(batch):
         with tf.GradientTape() as tape:
             logits = model(batch, training=True)
-            loss = mlm_loss(logits, batch["original_ids"], batch["mask_flag"])
-            loss += sum(model.losses)
+            loss   = mlm_loss(logits, batch["original_ids"], batch["mask_flag"])
+            loss  += sum(model.losses)
         gs = tape.gradient(loss, model.trainable_variables)
         gs, _ = tf.clip_by_global_norm(gs, gc)
         opt.apply_gradients(zip(gs, model.trainable_variables))
         labels = tf.clip_by_value(tf.cast(batch["original_ids"], tf.int32), 0, 19)
         mf = batch["mask_flag"]; nm = tf.reduce_sum(mf)
         pred1 = tf.argmax(logits, axis=-1, output_type=tf.int32)
-        c1 = tf.reduce_sum(tf.cast(tf.equal(pred1, labels), tf.float32) * mf)
+        c1    = tf.reduce_sum(tf.cast(tf.equal(pred1, labels), tf.float32) * mf)
         _, top5 = tf.math.top_k(logits, k=5)
         hit5 = tf.reduce_any(tf.equal(top5, labels[:,:,tf.newaxis]), axis=-1)
-        c5 = tf.reduce_sum(tf.cast(hit5, tf.float32) * mf)
+        c5   = tf.reduce_sum(tf.cast(hit5, tf.float32) * mf)
         loss_acc.assign_add(loss); step_acc.assign_add(1)
         acc1_acc.assign_add(c1); acc5_acc.assign_add(c5); nmask_acc.assign_add(nm)
 
     @tf.function(jit_compile=args.xla)
     def val_step(batch):
         logits = model(batch, training=False)
-        loss = mlm_loss(logits, batch["original_ids"], batch["mask_flag"])
+        loss   = mlm_loss(logits, batch["original_ids"], batch["mask_flag"])
         labels = tf.clip_by_value(tf.cast(batch["original_ids"], tf.int32), 0, 19)
         mf = batch["mask_flag"]; nm = tf.reduce_sum(mf)
         pred1 = tf.argmax(logits, axis=-1, output_type=tf.int32)
-        c1 = tf.reduce_sum(tf.cast(tf.equal(pred1, labels), tf.float32) * mf)
+        c1    = tf.reduce_sum(tf.cast(tf.equal(pred1, labels), tf.float32) * mf)
         _, top5 = tf.math.top_k(logits, k=5)
         hit5 = tf.reduce_any(tf.equal(top5, labels[:,:,tf.newaxis]), axis=-1)
-        c5 = tf.reduce_sum(tf.cast(hit5, tf.float32) * mf)
+        c5   = tf.reduce_sum(tf.cast(hit5, tf.float32) * mf)
         return loss, c1, c5, nm, logits
 
     start_ep, gstep, best_val, patience_ctr = 1, 0, float("inf"), 0
@@ -1092,8 +1042,9 @@ def train_mlm(args, meta):
             if args.ckpt_every > 0 and gstep % args.ckpt_every == 0:
                 save_ckpt(args, "mlm", model, ep, gstep, best_val, history)
 
-        tl = float(loss_acc)/max(int(step_acc),1)
-        t_nm = max(float(nmask_acc),1.); t1 = float(acc1_acc)/t_nm; t5 = float(acc5_acc)/t_nm
+        tl   = float(loss_acc)/max(int(step_acc),1)
+        t_nm = max(float(nmask_acc),1.)
+        t1   = float(acc1_acc)/t_nm; t5 = float(acc5_acc)/t_nm
         t_ppl = math.exp(min(tl, 30.))
 
         vl_s, v1, v5, vnm, vc = 0., 0., 0., 0., 0
@@ -1102,7 +1053,7 @@ def train_mlm(args, meta):
             l, c1, c5, nm, logits_v = val_step(b); vc += 1
             vl_s += float(l); v1 += float(c1); v5 += float(c5); vnm += float(nm)
             if viz_batch is None:
-                viz_batch = {k: v.numpy() for k, v in b.items()}
+                viz_batch  = {k: v.numpy() for k, v in b.items()}
                 viz_logits = logits_v.numpy()
         vl = vl_s/max(vc,1); vnm = max(vnm,1.)
         v_t1, v_t5 = v1/vnm, v5/vnm; v_ppl = math.exp(min(vl, 30.))
@@ -1192,24 +1143,23 @@ def _save_mlm_seq_viz(args, batch, logits, n_show=10):
 
 
 # =============================================================================
-# TRAINING: AUTOREGRESSIVE VAE
+# TRAINING: AUTOREGRESSIVE VAE — v3.4: freq losses/accumulators removed
 # =============================================================================
 def train_autoreg_vae(args, meta):
     log.info("=" * 60); log.info("STAGE: AUTOREGRESSIVE VAE"); log.info("=" * 60)
     n_train, n_val = meta["n_train"], meta["n_val"]
-    spe = max(1, n_train // args.batch_size)
-    vs = max(1, n_val // args.batch_size)
+    spe   = max(1, n_train // args.batch_size)
+    vs    = max(1, n_val   // args.batch_size)
     total = spe * args.epochs
     log.info("n_train=%d n_val=%d spe=%d total=%d bs=%d",
              n_train, n_val, spe, total, args.batch_size)
 
     train_ds = build_dataset(args, "train", "autoreg", shuffle=True)
-    val_ds = build_dataset(args, "val", "autoreg", shuffle=False)
+    val_ds   = build_dataset(args, "val",   "autoreg", shuffle=False)
 
     model = _init_model(AutoregVAEModel, args, _autoreg_dummy(args))
     model.summary(print_fn=log.info)
 
-    # Load pretrained MLM encoder
     cd = _ckpt_dir(args)
     mlm_path = None
     for wn in ["mlm_best.weights.h5", "mlm_final.weights.h5"]:
@@ -1239,73 +1189,67 @@ def train_autoreg_vae(args, meta):
     opt = make_optimizer(args, total); gc = args.grad_clip
     w_rs, w_rr, w_ar, w_kl = args.w_recon_seq, args.w_recon_round, args.w_autoreg, args.kl_weight
 
-    a_tot = tf.Variable(0.0, trainable=False)
-    a_mlm = tf.Variable(0.0, trainable=False)
-    a_ar_freq = tf.Variable(0.0, trainable=False)
-    a_ar_pres = tf.Variable(0.0, trainable=False)
-    a_ar_enrich = tf.Variable(0.0, trainable=False)
-    a_kl = tf.Variable(0.0, trainable=False)
-    a_vae_seq = tf.Variable(0.0, trainable=False)
-    a_vae_freq = tf.Variable(0.0, trainable=False)
-    a_vae_pres = tf.Variable(0.0, trainable=False)
+    a_tot        = tf.Variable(0.0, trainable=False)
+    a_mlm        = tf.Variable(0.0, trainable=False)
+    a_ar_pres    = tf.Variable(0.0, trainable=False)
+    a_ar_enrich  = tf.Variable(0.0, trainable=False)
+    a_kl         = tf.Variable(0.0, trainable=False)
+    a_vae_seq    = tf.Variable(0.0, trainable=False)
+    a_vae_pres   = tf.Variable(0.0, trainable=False)
     a_vae_enrich = tf.Variable(0.0, trainable=False)
-    a_st = tf.Variable(0, trainable=False, dtype=tf.int32)
+    a_st         = tf.Variable(0, trainable=False, dtype=tf.int32)
 
-    mf_weight = args.mlm_mask_frac
-    use_log_e = args.log_enrichment
+    mf_weight  = args.mlm_mask_frac
+    use_log_e  = args.log_enrichment
 
     @tf.function(jit_compile=args.xla)
     def train_step(batch):
         with tf.GradientTape() as tape:
-            out = model(batch, training=True)
+            out       = model(batch, training=True)
             enrich_gt = compute_enrichment(batch["freq"], use_log_e)
-            lm = mlm_loss(out["mlm_logits"], batch["seq"], batch["mlm_mask"]) * mf_weight
-            l_ar_f = out["ar_loss_freq"] * w_ar
-            l_ar_p = out["ar_loss_pres"] * w_ar
+            lm  = mlm_loss(out["mlm_logits"], batch["seq"], batch["mlm_mask"]) * mf_weight
+            l_ar_p = out["ar_loss_pres"]   * w_ar
             l_ar_e = out["ar_loss_enrich"] * w_ar
-            vs, vf, vp, ve = vae_recon_losses(
+            vs, vp, ve = vae_recon_losses(
                 out["seq_logits"], batch["seq"], batch["padding_mask"],
-                out["recon_freq"], batch["freq"],
                 out["recon_pres_logit"], batch["pres"],
-                out["recon_enrich"], enrich_gt)
-            l_vae_seq = vs * w_rs
-            l_vae_freq = vf * w_rr
-            l_vae_pres = vp * w_rr
+                out["recon_enrich"],     enrich_gt)
+            l_vae_seq    = vs * w_rs
+            l_vae_pres   = vp * w_rr
             l_vae_enrich = ve * w_rr
             lk = kl_divergence(out["mu"], out["logvar"]) * w_kl
-            total_loss = (lm + l_ar_f + l_ar_p + l_ar_e +
-                          l_vae_seq + l_vae_freq + l_vae_pres + l_vae_enrich +
+            total_loss = (lm + l_ar_p + l_ar_e +
+                          l_vae_seq + l_vae_pres + l_vae_enrich +
                           lk + sum(model.losses))
         gs = tape.gradient(total_loss, model.trainable_variables)
         gs, _ = tf.clip_by_global_norm(gs, gc)
         opt.apply_gradients(zip(gs, model.trainable_variables))
         a_tot.assign_add(total_loss); a_mlm.assign_add(lm)
-        a_ar_freq.assign_add(l_ar_f); a_ar_pres.assign_add(l_ar_p)
-        a_ar_enrich.assign_add(l_ar_e); a_kl.assign_add(lk)
-        a_vae_seq.assign_add(l_vae_seq); a_vae_freq.assign_add(l_vae_freq)
+        a_ar_pres.assign_add(l_ar_p); a_ar_enrich.assign_add(l_ar_e)
+        a_kl.assign_add(lk)
+        a_vae_seq.assign_add(l_vae_seq)
         a_vae_pres.assign_add(l_vae_pres); a_vae_enrich.assign_add(l_vae_enrich)
         a_st.assign_add(1)
 
     @tf.function(jit_compile=args.xla)
     def val_step(batch):
-        out = model(batch, training=False)
+        out       = model(batch, training=False)
         enrich_gt = compute_enrichment(batch["freq"], use_log_e)
-        vs, vf, vp, ve = vae_recon_losses(
+        vs, vp, ve = vae_recon_losses(
             out["seq_logits"], batch["seq"], batch["padding_mask"],
-            out["recon_freq"], batch["freq"],
             out["recon_pres_logit"], batch["pres"],
-            out["recon_enrich"], enrich_gt)
+            out["recon_enrich"],     enrich_gt)
         lk = kl_divergence(out["mu"], out["logvar"])
-        return ((out["ar_loss_freq"]+out["ar_loss_pres"]+out["ar_loss_enrich"])*w_ar +
-                vs*w_rs + (vf+vp+ve)*w_rr + lk*w_kl)
+        return ((out["ar_loss_pres"]+out["ar_loss_enrich"])*w_ar +
+                vs*w_rs + (vp+ve)*w_rr + lk*w_kl)
 
     start_ep, gstep, best_val, patience_ctr = 1, 0, float("inf"), 0
     history = {
         "train_loss": [], "val_loss": [],
         "mlm": [],
-        "ar_freq": [], "ar_pres": [], "ar_enrich": [],
+        "ar_pres": [], "ar_enrich": [],
         "kl": [],
-        "vae_seq_recon": [], "vae_freq_recon": [], "vae_pres_recon": [], "vae_enrich_recon": [],
+        "vae_seq_recon": [], "vae_pres_recon": [], "vae_enrich_recon": [],
     }
     if args.resume:
         st = load_ckpt(args, "autoreg_vae")
@@ -1318,8 +1262,8 @@ def train_autoreg_vae(args, meta):
 
     for ep in range(start_ep, args.epochs + 1):
         t0 = time.time()
-        for v in [a_tot, a_mlm, a_ar_freq, a_ar_pres, a_ar_enrich,
-                  a_kl, a_vae_seq, a_vae_freq, a_vae_pres, a_vae_enrich]:
+        for v in [a_tot, a_mlm, a_ar_pres, a_ar_enrich,
+                  a_kl, a_vae_seq, a_vae_pres, a_vae_enrich]:
             v.assign(0.0)
         a_st.assign(0)
 
@@ -1328,42 +1272,39 @@ def train_autoreg_vae(args, meta):
             if gstep % args.log_every == 0:
                 s = max(int(a_st), 1)
                 log.info("  step %d ep %d | tot=%.4f mlm=%.4f "
-                         "ar_f=%.4f ar_p=%.4f ar_e=%.4f kl=%.4f "
-                         "vs=%.4f vf=%.4f vp=%.4f ve=%.4f (%.0f s/s)",
+                         "ar_p=%.4f ar_e=%.4f kl=%.4f "
+                         "vs=%.4f vp=%.4f ve=%.4f (%.0f s/s)",
                          gstep, ep,
                          float(a_tot)/s, float(a_mlm)/s,
-                         float(a_ar_freq)/s, float(a_ar_pres)/s, float(a_ar_enrich)/s,
+                         float(a_ar_pres)/s, float(a_ar_enrich)/s,
                          float(a_kl)/s,
-                         float(a_vae_seq)/s, float(a_vae_freq)/s,
+                         float(a_vae_seq)/s,
                          float(a_vae_pres)/s, float(a_vae_enrich)/s,
                          s*args.batch_size/(time.time()-t0))
             if args.ckpt_every > 0 and gstep % args.ckpt_every == 0:
                 save_ckpt(args, "autoreg_vae", model, ep, gstep, best_val, history)
 
-        s = max(int(a_st), 1)
+        s  = max(int(a_st), 1)
         tl = float(a_tot)/s
         vl_s, vc = 0.0, 0
         for b in val_ds.take(vs):
             vl_s += float(val_step(b)); vc += 1
-        vl = vl_s / max(vc, 1)
+        vl      = vl_s / max(vc, 1)
         elapsed = time.time() - t0
         log.info("Epoch %d/%d train=%.4f val=%.4f (%.1fs) | "
-                 "mlm=%.4f ar_f=%.4f ar_p=%.4f ar_e=%.4f kl=%.4f "
-                 "vs=%.4f vf=%.4f vp=%.4f ve=%.4f",
+                 "mlm=%.4f ar_p=%.4f ar_e=%.4f kl=%.4f "
+                 "vs=%.4f vp=%.4f ve=%.4f",
                  ep, args.epochs, tl, vl, elapsed,
-                 float(a_mlm)/s, float(a_ar_freq)/s, float(a_ar_pres)/s,
-                 float(a_ar_enrich)/s, float(a_kl)/s,
-                 float(a_vae_seq)/s, float(a_vae_freq)/s,
-                 float(a_vae_pres)/s, float(a_vae_enrich)/s)
+                 float(a_mlm)/s, float(a_ar_pres)/s, float(a_ar_enrich)/s,
+                 float(a_kl)/s,
+                 float(a_vae_seq)/s, float(a_vae_pres)/s, float(a_vae_enrich)/s)
 
         history["train_loss"].append(tl); history["val_loss"].append(vl)
         history["mlm"].append(float(a_mlm)/s)
-        history["ar_freq"].append(float(a_ar_freq)/s)
         history["ar_pres"].append(float(a_ar_pres)/s)
         history["ar_enrich"].append(float(a_ar_enrich)/s)
         history["kl"].append(float(a_kl)/s)
         history["vae_seq_recon"].append(float(a_vae_seq)/s)
-        history["vae_freq_recon"].append(float(a_vae_freq)/s)
         history["vae_pres_recon"].append(float(a_vae_pres)/s)
         history["vae_enrich_recon"].append(float(a_vae_enrich)/s)
 
@@ -1383,72 +1324,29 @@ def train_autoreg_vae(args, meta):
 
 
 # =============================================================================
-# INFERENCE (with --num_decoding multi-order support)
+# INFERENCE — v3.4: dec_freq removed from outputs; gt_freq kept for reference
 # =============================================================================
 def _select_permutations(n_dec, seed):
-    """Select N decoding permutations from the 6 possible orderings of [R0,R1,R3].
-
-    For N<=6: sample without replacement (all unique orderings).
-    For N>6:  sample with replacement (some orderings repeated).
-
-    Args:
-        n_dec: Number of decoding orders.
-        seed: Random seed for reproducibility.
-    Returns:
-        perms_np: [N_dec, 3] int32 numpy array of permutation orderings.
-    """
     rng = np.random.RandomState(seed + 7777)
     if n_dec <= 6:
         idx = rng.choice(6, n_dec, replace=False)
     else:
         idx = rng.choice(6, n_dec, replace=True)
-    return ALL_PERMS_NP[idx]  # [N_dec, 3]
+    return ALL_PERMS_NP[idx]
 
 
 def run_inference(args, meta):
-    """Inference with N random decoding orders.
-
-    For each decoding order d in [0, N_dec):
-        - A fixed permutation of [R0,R1,R3] is used for the autoregressive decoder
-        - All sequences are processed in a single pass over the dataset
-        - Per-sequence outputs (z, mu, dec_freq, dec_pres, dec_enrich) are collected
-
-    Outputs:
-        decodings.h5:  HDF5 with per-sequence groups keyed by sequence ID.
-            /<seq_id>/z:           [N_dec, latent_dim]
-            /<seq_id>/mu:          [N_dec, latent_dim]
-            /<seq_id>/dec_freq:    [N_dec, 3]
-            /<seq_id>/dec_pres:    [N_dec, 3]
-            /<seq_id>/dec_enrich:  [N_dec, 3]
-            /<seq_id>/pooled:      [d_model]          (same across decodings)
-            /<seq_id>/gt_freq:     [3]
-            /<seq_id>/gt_pres:     [3]
-            /meta/perm_orders:     [N_dec, 3]
-            /meta/num_decoding:    scalar
-            /meta/mask_rounds:     string
-
-        latents.npz:  Mean values for backward-compatible analysis pipeline.
-            z, mu, dec_freq, dec_pres, dec_enrich: [N_total, dim] (mean over decodings)
-            *_std variants: [N_total, dim] (std over decodings)
-            pooled, gt_freq, gt_pres: [N_total, dim]
-
-        predictions.tsv:  Mean ± std per sequence.
-    """
     log.info("=" * 60); log.info("INFERENCE"); log.info("=" * 60)
-
     try:
         import h5py
     except ImportError:
-        log.error("h5py is required for inference with --num_decoding. "
-                  "Install with: pip install h5py")
-        return
+        log.error("h5py required. Install with: pip install h5py"); return
 
     N_dec = max(1, args.num_decoding)
     log.info("Decoding orders: %d", N_dec)
 
     model = _init_model(AutoregVAEModel, args, _autoreg_dummy(args))
-    cd = _ckpt_dir(args)
-    loaded = False
+    cd = _ckpt_dir(args); loaded = False
     for wn in ["autoreg_vae_best.weights.h5", "autoreg_vae_final.weights.h5",
                "autoreg_vae_latest.weights.h5"]:
         wp = os.path.join(cd, wn)
@@ -1456,28 +1354,19 @@ def run_inference(args, meta):
             model.load_weights(wp); log.info("Loaded: %s", wp); loaded = True; break
     if not loaded: log.error("No autoreg_vae weights in %s", cd); return
 
-    # Parse masked rounds
     mask_rounds = set()
     if args.inference_mask_rounds:
         for r in args.inference_mask_rounds.split(","):
             r = r.strip().upper()
             if r in ROUND_NAMES: mask_rounds.add(ROUND_NAMES.index(r))
     log.info("Masking rounds: %s", [ROUND_NAMES[i] for i in mask_rounds])
-    if not mask_rounds and N_dec > 1:
-        log.warning("No rounds masked (--inference_mask_rounds empty). "
-                    "With all rounds observed, all %d decoding orders will "
-                    "produce identical results (GT pass-through).", N_dec)
 
-    # Select permutations
-    perms_np = _select_permutations(N_dec, args.seed)  # [N_dec, 3]
+    perms_np    = _select_permutations(N_dec, args.seed)
     perm_labels = [f"[{','.join(ROUND_NAMES[r] for r in p)}]" for p in perms_np]
     log.info("Permutation orders: %s", perm_labels)
 
     out_dir = os.path.join(args.output_dir, "inference"); os.makedirs(out_dir, exist_ok=True)
 
-    # ---- Phase 1: Single data pass to get sequence count, IDs, and shared data ----
-    # Encoder output (pooled) and ground truth are independent of decode order,
-    # so we only compute them once.
     prefixes_available = []
     for prefix in ["train", "val", "test"]:
         tfdir = os.path.join(args.output_dir, "tfrecords")
@@ -1485,26 +1374,20 @@ def run_inference(args, meta):
             prefixes_available.append(prefix)
 
     log.info("Phase 1/%d: Collecting encoder embeddings + ground truth...", N_dec + 1)
-    shared = {"pooled": [], "gt_freq": [], "gt_pres": []}
-    all_ids = []
-    # Also store input tensors (ids, pmask, freq, pres) per batch for reuse
-    # to avoid re-reading TFRecords N_dec times.
-    # For memory efficiency on huge datasets, we store freq/pres/pmask compactly.
-    cached_batches = []  # list of (input_ids_np, pmask_np, freq_np, pres_np)
+    shared   = {"pooled": [], "gt_freq": [], "gt_pres": []}
+    all_ids  = []
+    cached_batches = []
     total = 0
 
     for prefix in prefixes_available:
         ds = build_dataset(args, prefix, "inference", shuffle=False)
         for batch in ds:
-            B_val = batch["input_ids"].shape[0]
-            # Encoder forward (order-independent)
-            pooled, _ = model.encoder(batch["input_ids"], batch["padding_mask"],
-                                      training=False)
+            B_val  = batch["input_ids"].shape[0]
+            pooled, _ = model.encoder(batch["input_ids"], batch["padding_mask"], training=False)
             shared["pooled"].append(pooled.numpy())
             shared["gt_freq"].append(batch["freq"].numpy())
             shared["gt_pres"].append(batch["pres"].numpy())
             all_ids.extend(s.numpy().decode("utf-8") for s in batch["sid"])
-            # Cache batch tensors for decode passes (avoid re-reading TFRecords)
             cached_batches.append((
                 batch["input_ids"].numpy(),
                 batch["padding_mask"].numpy(),
@@ -1515,146 +1398,108 @@ def run_inference(args, meta):
             if total % (args.inference_batch_size * 200) < args.inference_batch_size:
                 log.info("  encoded %d sequences", total)
 
-    for k in shared:
-        shared[k] = np.concatenate(shared[k], 0)
+    for k in shared: shared[k] = np.concatenate(shared[k], 0)
     N_total = shared["pooled"].shape[0]
     log.info("  Total: %d sequences, %d cached batches", N_total, len(cached_batches))
 
-    # ---- Phase 2: N_dec decode passes over cached batches ----
-    # Allocate output arrays: [N_total, N_dec, dim]
     latent_dim = args.vae_latent_dim
-    z_all = np.zeros((N_total, N_dec, latent_dim), dtype=np.float32)
+    z_all  = np.zeros((N_total, N_dec, latent_dim), dtype=np.float32)
     mu_all = np.zeros((N_total, N_dec, latent_dim), dtype=np.float32)
-    df_all = np.zeros((N_total, N_dec, 3), dtype=np.float32)
     dp_all = np.zeros((N_total, N_dec, 3), dtype=np.float32)
     de_all = np.zeros((N_total, N_dec, 3), dtype=np.float32)
 
     for d in range(N_dec):
-        perm = perms_np[d]  # [3] int32
-        t0 = time.time()
-        log.info("Phase %d/%d: Decoding with order %s ...",
-                 d + 2, N_dec + 1, perm_labels[d])
-
+        perm = perms_np[d]; t0 = time.time()
+        log.info("Phase %d/%d: Decoding with order %s ...", d+2, N_dec+1, perm_labels[d])
         offset = 0
         for ids_np, pmask_np, freq_np, pres_np in cached_batches:
-            B_val = ids_np.shape[0]
-            # Build per-batch permutation tensor
+            B_val    = ids_np.shape[0]
             perms_tf = tf.tile(tf.constant([perm], dtype=tf.int32), [B_val, 1])
-            # Build round mask
             rmask_cols = [
                 tf.ones([B_val]) if r in mask_rounds else tf.zeros([B_val])
                 for r in range(3)
             ]
-            rmask = tf.stack(rmask_cols, 1)  # [B, 3]
-
-            out = model.encode_to_latent(
+            rmask = tf.stack(rmask_cols, 1)
+            out   = model.encode_to_latent(
                 tf.constant(ids_np), tf.constant(pmask_np),
                 tf.constant(freq_np), tf.constant(pres_np),
                 round_mask_vec=rmask, perms=perms_tf)
-
             end = offset + B_val
-            z_all[offset:end, d] = out["z"].numpy()
+            z_all[offset:end, d]  = out["z"].numpy()
             mu_all[offset:end, d] = out["mu"].numpy()
-            df_all[offset:end, d] = out["dec_freq"].numpy()
             dp_all[offset:end, d] = out["dec_pres"].numpy()
             de_all[offset:end, d] = out["dec_enrich"].numpy()
             offset = end
-
-        elapsed = time.time() - t0
         log.info("  Decoding %d done in %.1fs (%.0f seq/s)",
-                 d, elapsed, N_total / max(elapsed, 1e-6))
+                 d, time.time()-t0, N_total/max(time.time()-t0, 1e-6))
 
-    # Free cached batch memory
     del cached_batches
 
-    # ---- Compute mean and std across decodings ----
-    z_mean, z_std = z_all.mean(axis=1), z_all.std(axis=1)
+    z_mean,  z_std  = z_all.mean(axis=1),  z_all.std(axis=1)
     mu_mean, mu_std = mu_all.mean(axis=1), mu_all.std(axis=1)
-    df_mean, df_std = df_all.mean(axis=1), df_all.std(axis=1)
     dp_mean, dp_std = dp_all.mean(axis=1), dp_all.std(axis=1)
     de_mean, de_std = de_all.mean(axis=1), de_all.std(axis=1)
 
-    # ---- Save HDF5 with per-sequence groups ----
     h5_path = os.path.join(out_dir, "decodings.h5")
     log.info("Writing HDF5: %s (%d sequences x %d decodings)", h5_path, N_total, N_dec)
-    PER_ID_THRESHOLD = 500_000  # per-ID groups are slow above this
+    PER_ID_THRESHOLD = 500_000
     t0_h5 = time.time()
 
     with h5py.File(h5_path, "w") as hf:
-        # Metadata group
         mg = hf.create_group("meta")
         mg.create_dataset("perm_orders", data=perms_np)
         mg.attrs["num_decoding"] = N_dec
-        mg.attrs["mask_rounds"] = args.inference_mask_rounds or ""
-        mg.attrs["perm_labels"] = json.dumps(perm_labels)
+        mg.attrs["mask_rounds"]  = args.inference_mask_rounds or ""
+        mg.attrs["perm_labels"]  = json.dumps(perm_labels)
 
-        # Flat arrays for efficient bulk access
         fg = hf.create_group("flat")
         dt_str = h5py.string_dtype(encoding="utf-8")
-        fg.create_dataset("ids", data=np.array(all_ids, dtype=object), dtype=dt_str)
-        fg.create_dataset("pooled", data=shared["pooled"], compression="gzip",
-                          compression_opts=4)
-        fg.create_dataset("gt_freq", data=shared["gt_freq"])
+        fg.create_dataset("ids",    data=np.array(all_ids, dtype=object), dtype=dt_str)
+        fg.create_dataset("pooled", data=shared["pooled"],   compression="gzip", compression_opts=4)
+        fg.create_dataset("gt_freq", data=shared["gt_freq"])   # reference only
         fg.create_dataset("gt_pres", data=shared["gt_pres"])
-        fg.create_dataset("z", data=z_all, compression="gzip", compression_opts=4)
-        fg.create_dataset("mu", data=mu_all, compression="gzip", compression_opts=4)
-        fg.create_dataset("dec_freq", data=df_all, compression="gzip",
-                          compression_opts=4)
-        fg.create_dataset("dec_pres", data=dp_all, compression="gzip",
-                          compression_opts=4)
-        fg.create_dataset("dec_enrich", data=de_all, compression="gzip",
-                          compression_opts=4)
-        # Mean/std for quick access
-        fg.create_dataset("z_mean", data=z_mean)
-        fg.create_dataset("z_std", data=z_std)
-        fg.create_dataset("dec_freq_mean", data=df_mean)
-        fg.create_dataset("dec_freq_std", data=df_std)
+        fg.create_dataset("z",       data=z_all,  compression="gzip", compression_opts=4)
+        fg.create_dataset("mu",      data=mu_all, compression="gzip", compression_opts=4)
+        fg.create_dataset("dec_pres",   data=dp_all, compression="gzip", compression_opts=4)
+        fg.create_dataset("dec_enrich", data=de_all, compression="gzip", compression_opts=4)
+        fg.create_dataset("z_mean",        data=z_mean)
+        fg.create_dataset("z_std",         data=z_std)
         fg.create_dataset("dec_pres_mean", data=dp_mean)
-        fg.create_dataset("dec_pres_std", data=dp_std)
+        fg.create_dataset("dec_pres_std",  data=dp_std)
         fg.create_dataset("dec_enrich_mean", data=de_mean)
-        fg.create_dataset("dec_enrich_std", data=de_std)
+        fg.create_dataset("dec_enrich_std",  data=de_std)
 
-        # Per-sequence groups keyed by ID
         if N_total <= PER_ID_THRESHOLD:
             bg = hf.create_group("by_id")
             for i in range(N_total):
-                sid = all_ids[i]
-                sg = bg.create_group(sid)
-                sg.create_dataset("z", data=z_all[i])              # [N_dec, latent]
-                sg.create_dataset("mu", data=mu_all[i])             # [N_dec, latent]
-                sg.create_dataset("dec_freq", data=df_all[i])       # [N_dec, 3]
-                sg.create_dataset("dec_pres", data=dp_all[i])       # [N_dec, 3]
-                sg.create_dataset("dec_enrich", data=de_all[i])     # [N_dec, 3]
-                sg.create_dataset("pooled", data=shared["pooled"][i])  # [d_model]
-                sg.create_dataset("gt_freq", data=shared["gt_freq"][i])  # [3]
-                sg.create_dataset("gt_pres", data=shared["gt_pres"][i])  # [3]
-                if (i + 1) % 100_000 == 0:
-                    log.info("  HDF5 per-ID: %d/%d", i + 1, N_total)
+                sid = all_ids[i]; sg = bg.create_group(sid)
+                sg.create_dataset("z",          data=z_all[i])
+                sg.create_dataset("mu",         data=mu_all[i])
+                sg.create_dataset("dec_pres",   data=dp_all[i])
+                sg.create_dataset("dec_enrich", data=de_all[i])
+                sg.create_dataset("pooled",     data=shared["pooled"][i])
+                sg.create_dataset("gt_freq",    data=shared["gt_freq"][i])
+                sg.create_dataset("gt_pres",    data=shared["gt_pres"][i])
+                if (i+1) % 100_000 == 0:
+                    log.info("  HDF5 per-ID: %d/%d", i+1, N_total)
         else:
-            log.info("  Skipping per-ID groups (N=%d > %d). Use flat/ arrays "
-                     "with flat/ids for lookup.", N_total, PER_ID_THRESHOLD)
+            log.info("  Skipping per-ID groups (N=%d > %d).", N_total, PER_ID_THRESHOLD)
 
-    log.info("  HDF5 written in %.1fs", time.time() - t0_h5)
+    log.info("  HDF5 written in %.1fs", time.time()-t0_h5)
 
-    # ---- Save backward-compatible latents.npz (mean values) ----
     np.savez_compressed(os.path.join(out_dir, "latents.npz"),
                         z=z_mean, mu=mu_mean,
-                        dec_freq=df_mean, dec_pres=dp_mean, dec_enrich=de_mean,
+                        dec_pres=dp_mean, dec_enrich=de_mean,
                         z_std=z_std, mu_std=mu_std,
-                        dec_freq_std=df_std, dec_pres_std=dp_std,
-                        dec_enrich_std=de_std,
+                        dec_pres_std=dp_std, dec_enrich_std=de_std,
                         pooled=shared["pooled"],
                         gt_freq=shared["gt_freq"], gt_pres=shared["gt_pres"],
                         num_decoding=N_dec)
-    log.info("Saved latents.npz (mean values)")
+    log.info("Saved latents.npz")
 
-    # ---- Save predictions TSV with mean ± std ----
     tsv_path = os.path.join(out_dir, "predictions.tsv")
     with open(tsv_path, "w") as f:
         hdr = ("seq_id\tz_norm_mean\tz_norm_std\t"
-               "dec_freq_R0_mean\tdec_freq_R0_std\t"
-               "dec_freq_R1_mean\tdec_freq_R1_std\t"
-               "dec_freq_R3_mean\tdec_freq_R3_std\t"
                "dec_pres_R0_mean\tdec_pres_R0_std\t"
                "dec_pres_R1_mean\tdec_pres_R1_std\t"
                "dec_pres_R3_mean\tdec_pres_R3_std\t"
@@ -1663,16 +1508,11 @@ def run_inference(args, meta):
                "dec_enrich_R3_mean\tdec_enrich_R3_std\t"
                "num_decoding\n")
         f.write(hdr)
-        # z_norm per decoding: [N_total, N_dec]
-        z_norms = np.linalg.norm(z_all, axis=2)  # [N, N_dec]
-        zn_mean = z_norms.mean(axis=1)
-        zn_std = z_norms.std(axis=1)
+        z_norms = np.linalg.norm(z_all, axis=2)
+        zn_mean = z_norms.mean(axis=1); zn_std = z_norms.std(axis=1)
         for i in range(N_total):
-            sid = all_ids[i] if i < len(all_ids) else str(i)
-            parts = [sid,
-                     f"{zn_mean[i]:.6f}", f"{zn_std[i]:.6f}"]
-            for ri in range(3):
-                parts.extend([f"{df_mean[i,ri]:.6f}", f"{df_std[i,ri]:.6f}"])
+            sid   = all_ids[i] if i < len(all_ids) else str(i)
+            parts = [sid, f"{zn_mean[i]:.6f}", f"{zn_std[i]:.6f}"]
             for ri in range(3):
                 parts.extend([f"{dp_mean[i,ri]:.4f}", f"{dp_std[i,ri]:.4f}"])
             for ri in range(3):
@@ -1681,22 +1521,17 @@ def run_inference(args, meta):
             f.write("\t".join(parts) + "\n")
     log.info("Saved predictions TSV: %s", tsv_path)
 
-    # ---- Save decode-order metadata ----
-    meta_path = os.path.join(out_dir, "decoding_meta.json")
-    with open(meta_path, "w") as f:
-        json.dump({
-            "num_decoding": N_dec,
-            "mask_rounds": [ROUND_NAMES[i] for i in mask_rounds],
-            "perm_orders": perms_np.tolist(),
-            "perm_labels": perm_labels,
-            "n_sequences": N_total,
-        }, f, indent=2)
-    log.info("Saved decoding metadata: %s", meta_path)
+    with open(os.path.join(out_dir, "decoding_meta.json"), "w") as f:
+        json.dump({"num_decoding": N_dec,
+                   "mask_rounds": [ROUND_NAMES[i] for i in mask_rounds],
+                   "perm_orders": perms_np.tolist(),
+                   "perm_labels": perm_labels,
+                   "n_sequences": N_total}, f, indent=2)
     log.info("Inference complete -> %s", out_dir)
 
 
 # =============================================================================
-# GENERATOR
+# GENERATOR — v3.4: generate_from_z returns (seq_logits, pres_logit, enrich)
 # =============================================================================
 def run_generator(args, meta):
     log.info("=" * 60); log.info("GENERATOR"); log.info("=" * 60)
@@ -1708,27 +1543,26 @@ def run_generator(args, meta):
     else: log.error("No weights found"); return
 
     out_dir = os.path.join(args.output_dir, "generated"); os.makedirs(out_dir, exist_ok=True)
-    n = args.n_generate
-    z = tf.random.normal([n, args.vae_latent_dim])
-    seq_logits, recon_freq, recon_pres_logit, recon_enrich = model.generate_from_z(z)
+    n   = args.n_generate
+    z   = tf.random.normal([n, args.vae_latent_dim])
+    seq_logits, recon_pres_logit, recon_enrich = model.generate_from_z(z)
     seq_ids = tf.argmax(seq_logits, -1).numpy()
-    rf, rp, re = recon_freq.numpy(), tf.nn.sigmoid(recon_pres_logit).numpy(), recon_enrich.numpy()
+    rp = tf.nn.sigmoid(recon_pres_logit).numpy()
+    re = recon_enrich.numpy()
     idx2aa = {i: a for a, i in AA2I.items()}
     with open(os.path.join(out_dir, "generated.fasta"), "w") as ff:
         with open(os.path.join(out_dir, "generated_rounds.tsv"), "w") as ft:
-            ft.write("gen_id\tfreq_R0\tfreq_R1\tfreq_R3\tpres_R0\tpres_R1\tpres_R3\t"
-                     "enrich_R0\tenrich_R1\tenrich_R3\n")
+            ft.write("gen_id\tpres_R0\tpres_R1\tpres_R3\tenrich_R0\tenrich_R1\tenrich_R3\n")
             for i in range(n):
                 seq = "".join(idx2aa.get(int(aa), "X") for aa in seq_ids[i] if int(aa) < N_AA)
                 ff.write(f">gen_{i}\n{seq}\n")
-                ft.write(f"gen_{i}\t{rf[i,0]:.6f}\t{rf[i,1]:.6f}\t{rf[i,2]:.6f}\t"
-                         f"{rp[i,0]:.4f}\t{rp[i,1]:.4f}\t{rp[i,2]:.4f}\t"
+                ft.write(f"gen_{i}\t{rp[i,0]:.4f}\t{rp[i,1]:.4f}\t{rp[i,2]:.4f}\t"
                          f"{re[i,0]:.4f}\t{re[i,1]:.4f}\t{re[i,2]:.4f}\n")
     log.info("Generated %d sequences -> %s", n, out_dir)
 
 
 # =============================================================================
-# ANALYSIS (uses mean values from latents.npz)
+# ANALYSIS — v3.4: freq plots removed; enrich/pres plots unchanged
 # =============================================================================
 def run_analysis(args, meta):
     log.info("=" * 60); log.info("ANALYSIS"); log.info("=" * 60)
@@ -1739,16 +1573,15 @@ def run_analysis(args, meta):
 
     out_dir = os.path.join(args.output_dir, "analysis"); os.makedirs(out_dir, exist_ok=True)
 
-    # ========== MLM curves ==========
+    # MLM curves
     mlm_sp = os.path.join(_ckpt_dir(args), "mlm_state.json")
     if os.path.exists(mlm_sp):
         with open(mlm_sp) as f: hist = json.load(f).get("history", {})
-
         mlm_panels = [
-            ("train_loss", "val_loss", "MLM CE Loss", "Loss", "mlm_loss.png"),
-            ("train_ppl", "val_ppl", "MLM Perplexity (exp(CE))", "PPL", "mlm_perplexity.png"),
-            ("train_top1", "val_top1", "MLM Top-1 Masked Accuracy", "Accuracy", "mlm_top1.png"),
-            ("train_top5", "val_top5", "MLM Top-5 Masked Accuracy", "Accuracy", "mlm_top5.png"),
+            ("train_loss", "val_loss", "MLM CE Loss",          "Loss",     "mlm_loss.png"),
+            ("train_ppl",  "val_ppl",  "MLM Perplexity",       "PPL",      "mlm_perplexity.png"),
+            ("train_top1", "val_top1", "MLM Top-1 Accuracy",   "Accuracy", "mlm_top1.png"),
+            ("train_top5", "val_top5", "MLM Top-5 Accuracy",   "Accuracy", "mlm_top5.png"),
         ]
         for tk, vk, title, ylabel, fname in mlm_panels:
             if not hist.get(tk): continue
@@ -1759,7 +1592,7 @@ def run_analysis(args, meta):
             ax.legend(); ax.grid(alpha=0.3)
             if "Acc" in ylabel: ax.set_ylim(0, 1)
             fig.savefig(os.path.join(out_dir, fname), dpi=150, bbox_inches="tight")
-            plt.close(fig); log.info("Saved %s", fname)
+            plt.close(fig)
 
         if all(hist.get(k) for k in ["train_loss","train_ppl","train_top1","train_top5"]):
             fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -1774,13 +1607,11 @@ def run_analysis(args, meta):
             fig.savefig(os.path.join(out_dir, "mlm_summary.png"), dpi=150, bbox_inches="tight")
             plt.close(fig); log.info("Saved mlm_summary.png")
 
-    # MLM sequence visualization from model
     mlm_wt = None
     for wn in ["mlm_best.weights.h5", "mlm_final.weights.h5"]:
         wp = os.path.join(_ckpt_dir(args), wn)
         if os.path.exists(wp): mlm_wt = wp; break
     if mlm_wt:
-        log.info("Loading MLM for sequence visualization...")
         mlm_m = _init_model(MLMModel, args, _mlm_dummy(args))
         mlm_m.load_weights(mlm_wt)
         val_ds = build_dataset(args, "val", "mlm", shuffle=False)
@@ -1789,11 +1620,10 @@ def run_analysis(args, meta):
             _save_mlm_seq_viz(args, {k: v.numpy() for k,v in b.items()}, lo, 10); break
         del mlm_m
 
-    # ========== Autoreg-VAE curves ==========
+    # Autoreg-VAE curves
     av_sp = os.path.join(_ckpt_dir(args), "autoreg_vae_state.json")
     if os.path.exists(av_sp):
         with open(av_sp) as f: hist = json.load(f).get("history", {})
-
         if hist.get("train_loss"):
             fig, ax = plt.subplots(figsize=(8, 5))
             ax.plot(hist["train_loss"], label="train", lw=1.5)
@@ -1801,18 +1631,16 @@ def run_analysis(args, meta):
             ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
             ax.set_title("Autoreg-VAE Total Loss"); ax.legend(); ax.grid(alpha=0.3)
             fig.savefig(os.path.join(out_dir, "av_total_loss.png"), dpi=150, bbox_inches="tight")
-            plt.close(fig); log.info("Saved av_total_loss.png")
+            plt.close(fig)
 
         comp_plots = [
-            ("kl", "KL Divergence", "KL", "av_kl.png"),
-            ("vae_seq_recon", "VAE Sequence Reconstruction (CCE)", "Loss", "av_vae_seq_recon.png"),
-            ("vae_freq_recon", "VAE Frequency Reconstruction (MSE)", "Loss", "av_vae_freq_recon.png"),
-            ("vae_pres_recon", "VAE Presence Reconstruction (BCE)", "Loss", "av_vae_pres_recon.png"),
-            ("vae_enrich_recon", "VAE Enrichment Reconstruction (MSE)", "Loss", "av_vae_enrich_recon.png"),
-            ("ar_freq", "Autoreg Frequency Prediction (MSE)", "Loss", "av_ar_freq.png"),
-            ("ar_pres", "Autoreg Presence Prediction (BCE)", "Loss", "av_ar_pres.png"),
-            ("ar_enrich", "Autoreg Enrichment Prediction (MSE)", "Loss", "av_ar_enrich.png"),
-            ("mlm", "Auxiliary MLM Loss", "Loss", "av_mlm_aux.png"),
+            ("kl",              "KL Divergence",                     "KL",   "av_kl.png"),
+            ("vae_seq_recon",   "VAE Sequence Reconstruction (CCE)", "Loss", "av_vae_seq_recon.png"),
+            ("vae_pres_recon",  "VAE Presence Reconstruction (BCE)", "Loss", "av_vae_pres_recon.png"),
+            ("vae_enrich_recon","VAE Enrichment Reconstruction (MSE)","Loss","av_vae_enrich_recon.png"),
+            ("ar_pres",         "Autoreg Presence (BCE)",            "Loss", "av_ar_pres.png"),
+            ("ar_enrich",       "Autoreg Enrichment (MSE)",          "Loss", "av_ar_enrich.png"),
+            ("mlm",             "Auxiliary MLM Loss",                "Loss", "av_mlm_aux.png"),
         ]
         for key, title, ylabel, fname in comp_plots:
             if not hist.get(key): continue
@@ -1821,32 +1649,31 @@ def run_analysis(args, meta):
             ax.set_xlabel("Epoch"); ax.set_ylabel(ylabel); ax.set_title(title)
             ax.grid(alpha=0.3)
             fig.savefig(os.path.join(out_dir, fname), dpi=150, bbox_inches="tight")
-            plt.close(fig); log.info("Saved %s", fname)
+            plt.close(fig)
 
-        ar_keys = ["ar_freq", "ar_pres", "ar_enrich"]
-        if all(hist.get(k) for k in ar_keys):
-            fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-            for ax, k, title in zip(axes, ar_keys, ["Freq (MSE)","Presence (BCE)","Enrichment (MSE)"]):
+        if hist.get("ar_pres") and hist.get("ar_enrich"):
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            for ax, k, title in zip(axes, ["ar_pres","ar_enrich"],
+                                    ["Presence (BCE)","Enrichment (MSE)"]):
                 ax.plot(hist[k], lw=1.5); ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
                 ax.set_title(f"Autoreg {title}"); ax.grid(alpha=0.3)
             fig.suptitle("Autoregressive Component Losses", fontsize=14, fontweight="bold")
             fig.tight_layout(rect=[0,0,1,.94])
             fig.savefig(os.path.join(out_dir, "av_autoreg_summary.png"), dpi=150, bbox_inches="tight")
-            plt.close(fig); log.info("Saved av_autoreg_summary.png")
+            plt.close(fig)
 
-        vae_keys = ["vae_seq_recon", "vae_freq_recon", "vae_pres_recon", "vae_enrich_recon"]
+        vae_keys = ["vae_seq_recon", "vae_pres_recon", "vae_enrich_recon"]
         if all(hist.get(k) for k in vae_keys):
-            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-            for ax, k, title in zip(axes.flat, vae_keys,
-                                    ["Seq (CCE)","Freq (MSE)","Presence (BCE)","Enrichment (MSE)"]):
+            fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+            for ax, k, title in zip(axes, vae_keys, ["Seq (CCE)","Presence (BCE)","Enrichment (MSE)"]):
                 ax.plot(hist[k], lw=1.5); ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
                 ax.set_title(f"VAE Recon: {title}"); ax.grid(alpha=0.3)
             fig.suptitle("VAE Reconstruction Losses", fontsize=14, fontweight="bold")
             fig.tight_layout(rect=[0,0,1,.95])
             fig.savefig(os.path.join(out_dir, "av_vae_recon_summary.png"), dpi=150, bbox_inches="tight")
-            plt.close(fig); log.info("Saved av_vae_recon_summary.png")
+            plt.close(fig)
 
-    # ========== PR / AUC ROC on predicted presence per round (uses mean values) ==========
+    # PR / ROC (unchanged logic, uses dec_pres from latents.npz)
     lat_path = os.path.join(args.output_dir, "inference", "latents.npz")
     if not os.path.exists(lat_path):
         cd = _ckpt_dir(args)
@@ -1865,107 +1692,75 @@ def run_analysis(args, meta):
             log.warning("scikit-learn not installed — skipping AUC/PR.")
 
     if os.path.exists(lat_path) and _has_sklearn:
-        lat = np.load(lat_path)
-        # dec_pres in latents.npz is the mean across decodings
-        pred_pres = lat["dec_pres"] if "dec_pres" in lat else None
-        gt_pres = lat["gt_pres"] if "gt_pres" in lat else None
+        lat       = np.load(lat_path)
+        pred_pres = lat.get("dec_pres",  None)
+        gt_pres   = lat.get("gt_pres",   None)
         n_dec_used = int(lat["num_decoding"]) if "num_decoding" in lat else 1
-
-        # Backward compat: old latents.npz may lack gt_pres.
-        # If missing, re-run inference to regenerate with the new format.
-        if gt_pres is None or pred_pres is None:
-            log.warning("latents.npz missing gt_pres or dec_pres — "
-                        "re-running inference to regenerate...")
-            run_inference(args, meta)
-            lat = np.load(lat_path)
-            pred_pres = lat.get("dec_pres", None)
-            gt_pres = lat.get("gt_pres", None)
-            n_dec_used = int(lat["num_decoding"]) if "num_decoding" in lat else 1
 
         if (gt_pres is not None and pred_pres is not None
                 and len(gt_pres) > 0 and len(pred_pres) > 0):
             n_samples = min(len(gt_pres), len(pred_pres))
             gt_pres, pred_pres = gt_pres[:n_samples], pred_pres[:n_samples]
-
-            subtitle = (f"(mean over {n_dec_used} decoding orders)"
-                        if n_dec_used > 1 else "")
+            subtitle = (f"(mean over {n_dec_used} decoding orders)" if n_dec_used > 1 else "")
 
             fig_roc, axes_roc = plt.subplots(1, 3, figsize=(18, 5))
-            fig_pr, axes_pr = plt.subplots(1, 3, figsize=(18, 5))
+            fig_pr,  axes_pr  = plt.subplots(1, 3, figsize=(18, 5))
             for ri, rname in enumerate(ROUND_NAMES):
                 yt, ys = gt_pres[:, ri], pred_pres[:, ri]
                 if len(np.unique(yt)) < 2:
-                    log.info("  %s presence: single class — skipping", rname)
                     axes_roc[ri].set_title(f"{rname} — single class")
                     axes_pr[ri].set_title(f"{rname} — single class")
                     continue
                 auc = roc_auc_score(yt, ys)
-                ap = average_precision_score(yt, ys)
+                ap  = average_precision_score(yt, ys)
                 log.info("  %s presence: AUC=%.4f  AP=%.4f", rname, auc, ap)
-
                 fpr, tpr, _ = roc_curve(yt, ys)
                 axes_roc[ri].plot(fpr, tpr, lw=1.5)
                 axes_roc[ri].plot([0,1],[0,1],"--",color="gray",alpha=0.5)
                 axes_roc[ri].set_xlabel("FPR"); axes_roc[ri].set_ylabel("TPR")
                 axes_roc[ri].set_title(f"{rname} Presence ROC (AUC={auc:.3f})")
                 axes_roc[ri].grid(alpha=0.3)
-
                 prec, rec, _ = precision_recall_curve(yt, ys)
                 axes_pr[ri].plot(rec, prec, lw=1.5)
                 axes_pr[ri].set_xlabel("Recall"); axes_pr[ri].set_ylabel("Precision")
                 axes_pr[ri].set_title(f"{rname} Presence PR (AP={ap:.3f})")
                 axes_pr[ri].grid(alpha=0.3)
-
-            fig_roc.suptitle(f"Autoreg Presence Prediction — ROC per Round {subtitle}",
-                             fontsize=14)
+            fig_roc.suptitle(f"Autoreg Presence — ROC per Round {subtitle}", fontsize=14)
             fig_roc.tight_layout(rect=[0,0,1,.94])
-            fig_roc.savefig(os.path.join(out_dir, "presence_roc_per_round.png"),
-                            dpi=150, bbox_inches="tight")
+            fig_roc.savefig(os.path.join(out_dir, "presence_roc_per_round.png"), dpi=150, bbox_inches="tight")
             plt.close(fig_roc)
-
-            fig_pr.suptitle(f"Autoreg Presence Prediction — PR per Round {subtitle}",
-                            fontsize=14)
+            fig_pr.suptitle(f"Autoreg Presence — PR per Round {subtitle}", fontsize=14)
             fig_pr.tight_layout(rect=[0,0,1,.94])
-            fig_pr.savefig(os.path.join(out_dir, "presence_pr_per_round.png"),
-                           dpi=150, bbox_inches="tight")
+            fig_pr.savefig(os.path.join(out_dir, "presence_pr_per_round.png"), dpi=150, bbox_inches="tight")
             plt.close(fig_pr)
             log.info("Saved presence ROC and PR plots")
 
-    # ========== UMAP (uses mean z) ==========
-    lat_path = os.path.join(args.output_dir, "inference", "latents.npz")
+    # UMAP (unchanged)
     if os.path.exists(lat_path):
         try:
             import umap
-            lat = np.load(lat_path)
-            z = lat["z"] if "z" in lat else (lat["mu"] if "mu" in lat else None)
-            gt_pres_umap = lat["gt_pres"] if "gt_pres" in lat else None
-            dec_e = lat["dec_enrich"] if "dec_enrich" in lat else None
-            n_dec_used = int(lat["num_decoding"]) if "num_decoding" in lat else 1
-
+            lat  = np.load(lat_path)
+            z    = lat["z"] if "z" in lat else (lat["mu"] if "mu" in lat else None)
+            gt_pres_umap = lat.get("gt_pres",    None)
+            dec_e        = lat.get("dec_enrich",  None)
+            n_dec_used   = int(lat["num_decoding"]) if "num_decoding" in lat else 1
             if z is not None and len(z) > 100:
-                log.info("Computing UMAP on mean z (from %d decoding orders)...",
-                         n_dec_used)
+                log.info("Computing UMAP on mean z (%d decoding orders)...", n_dec_used)
                 max_pts = min(50000, len(z))
-                idx = np.random.choice(len(z), max_pts, replace=False)
-                emb = umap.UMAP(n_components=2, random_state=args.seed).fit_transform(z[idx])
-
-                subtitle = (f" (mean of {n_dec_used} decodings)"
-                            if n_dec_used > 1 else "")
-
+                idx  = np.random.choice(len(z), max_pts, replace=False)
+                emb  = umap.UMAP(n_components=2, random_state=args.seed).fit_transform(z[idx])
+                subtitle = (f" (mean of {n_dec_used} decodings)" if n_dec_used > 1 else "")
                 if dec_e is not None:
                     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
                     for ri, rname in enumerate(ROUND_NAMES):
                         sc = axes[ri].scatter(emb[:,0], emb[:,1],
                                               c=np.log1p(dec_e[idx, ri]),
                                               cmap="viridis", s=1, alpha=0.5)
-                        axes[ri].set_title(
-                            f"UMAP — log(1+enrichment_{rname}){subtitle}")
+                        axes[ri].set_title(f"UMAP — log(1+enrichment_{rname}){subtitle}")
                         plt.colorbar(sc, ax=axes[ri])
                     fig.tight_layout()
-                    fig.savefig(os.path.join(out_dir, "umap_enrichment.png"),
-                                dpi=150, bbox_inches="tight")
+                    fig.savefig(os.path.join(out_dir, "umap_enrichment.png"), dpi=150, bbox_inches="tight")
                     plt.close(fig)
-
                 if gt_pres_umap is not None:
                     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
                     for ri, rname in enumerate(ROUND_NAMES):
@@ -1975,13 +1770,10 @@ def run_analysis(args, meta):
                         axes[ri].set_title(f"UMAP — {rname} presence")
                         plt.colorbar(sc, ax=axes[ri])
                     fig.tight_layout()
-                    fig.savefig(os.path.join(out_dir, "umap_presence.png"),
-                                dpi=150, bbox_inches="tight")
+                    fig.savefig(os.path.join(out_dir, "umap_presence.png"), dpi=150, bbox_inches="tight")
                     plt.close(fig)
-
-                np.savez_compressed(os.path.join(out_dir, "umap_coords.npz"),
-                                    coords=emb, indices=idx)
-                log.info("Saved UMAP plot")
+                np.savez_compressed(os.path.join(out_dir, "umap_coords.npz"), coords=emb, indices=idx)
+                log.info("Saved UMAP plots")
         except ImportError:
             log.warning("umap-learn not installed — skipping UMAP.")
 
@@ -1989,7 +1781,7 @@ def run_analysis(args, meta):
 
 
 # =============================================================================
-# MAIN
+# MAIN  (unchanged)
 # =============================================================================
 def main():
     args = parse_args(); set_seeds(args.seed)
@@ -1999,7 +1791,6 @@ def main():
         tf.keras.mixed_precision.set_global_policy("mixed_float16")
         log.info("Mixed precision enabled")
     if args.xla: log.info("XLA enabled")
-
     if _gpus: log.info("GPUs: %s", [g.name for g in _gpus])
     else: log.info("No GPU — CPU mode")
 
@@ -2014,11 +1805,11 @@ def main():
     log.info("Data: n_total=%d n_train=%d n_val=%d n_test=%d",
              meta["n_total"], meta["n_train"], meta["n_val"], meta["n_test"])
 
-    if args.mlm: train_mlm(args, meta)
+    if args.mlm:               train_mlm(args, meta)
     if args.autoregressive_vae: train_autoreg_vae(args, meta)
-    if args.inference: run_inference(args, meta)
-    if args.generator: run_generator(args, meta)
-    if args.analysis: run_analysis(args, meta)
+    if args.inference:         run_inference(args, meta)
+    if args.generator:         run_generator(args, meta)
+    if args.analysis:          run_analysis(args, meta)
 
     if not any([args.mlm, args.autoregressive_vae, args.inference, args.generator, args.analysis]):
         log.info("No stage selected. Use --mlm, --autoregressive_vae, --inference, --generator, or --analysis.")
